@@ -30,9 +30,9 @@ from app.ui.si_theme import (
 )
 from app.ui.toast import Toast
 
-GITHUB_URL = "https://github.com/huanyuejue/MiHome-Windows"
+GITHUB_URL = "https://github.com/PlanetEditorX/MiHome-Windows"
 MIJIA_API_URL = "https://github.com/Do1e/mijia-api"
-LICENSE_URL = "https://github.com/huanyuejue/MiHome-Windows/blob/main/LICENSE"
+LICENSE_URL = "https://github.com/PlanetEditorX/MiHome-Windows/blob/main/LICENSE"
 
 # 与 pyproject.toml 的 project.license 保持一致
 LICENSE_ID = "GPL-3.0-or-later"

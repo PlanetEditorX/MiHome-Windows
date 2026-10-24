@@ -33,7 +33,7 @@
 ### 一键运行
 
 ```powershell
-git clone https://github.com/huanyuejue/MiHome-Windows.git
+git clone https://github.com/PlanetEditorX/MiHome-Windows.git
 cd MiHome-Windows
 
 # 双击 start.bat，或命令行执行：
@@ -45,7 +45,7 @@ start.bat
 ### 手动运行
 
 ```powershell
-git clone https://github.com/huanyuejue/MiHome-Windows.git
+git clone https://github.com/PlanetEditorX/MiHome-Windows.git
 cd MiHome-Windows
 
 python -m venv .venv
