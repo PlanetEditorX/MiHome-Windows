@@ -36,11 +36,19 @@ _DEFAULTS: dict = {
     "check_update_enabled": True,  # 启动时自动检查 GitHub 新版本
     # 锁屏联动：会话锁屏/解锁时自动开关指定设备（见 core/lock_automation.py）。
     # 默认语义即最常见的用法：解锁开灯、锁屏关灯。
+    # time_*：生效时间段（每日，支持跨午夜）；关闭=不限制时段。
+    # net_*：生效网络名单（WiFi 名/以太网名，包含匹配）；关闭或名单
+    #        为空=不限制网络。两者任一不满足，本次事件跳过并提示。
     "lock_automation": {
         "enabled": False,
         "did": "",             # 目标设备 did；空串=尚未选择
         "unlock_action": "on",  # 解锁时对该设备做什么：on / off / none
         "lock_action": "off",   # 锁屏时对该设备做什么：on / off / none
+        "time_enabled": False,  # 是否限定生效时间段
+        "time_start": "08:00",  # 时段起 HH:MM（含）
+        "time_end": "23:00",    # 时段止 HH:MM（不含）；起>止=跨午夜
+        "net_enabled": False,   # 是否限定生效网络
+        "net_names": [],        # 生效网络名列表（大小写不敏感包含匹配）
     },
 }
 
@@ -179,14 +187,40 @@ _LOCK_DEFAULTS = {
     "did": "",
     "unlock_action": "on",
     "lock_action": "off",
+    "time_enabled": False,
+    "time_start": "08:00",
+    "time_end": "23:00",
+    "net_enabled": False,
+    "net_names": [],
 }
+
+
+def _normalize_hhmm(value, default: str) -> str:
+    """HH:MM 合法性收敛；非法（含非字符串）回落默认值。"""
+    from app.core.lock_conditions import parse_hhmm, format_hhmm
+    parsed = parse_hhmm(value)
+    if parsed is None:
+        return default
+    return f"{parsed[0]:02d}:{parsed[1]:02d}"
+
+
+def _normalize_net_names(value) -> list[str]:
+    """网络名单收敛：只保留非空字符串，去重保序；非列表按空处理。"""
+    if not isinstance(value, (list, tuple)):
+        return []
+    seen: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip() and item.strip() not in seen:
+            seen.append(item.strip())
+    return seen
 
 
 def _normalize_lock_automation(raw) -> dict:
     """把磁盘/界面传入的配置收敛成合法结构；非法字段回落默认值。
 
     动作只认 on / off / none（none=该方向不动作，例如只想关不想开）；
-    did 必须是字符串（设备 id），其余类型一律按未选择处理。
+    did 必须是字符串（设备 id），其余类型一律按未选择处理；
+    生效时间两端必须是合法 HH:MM；生效网络名单过滤非字符串并去重。
     """
     if not isinstance(raw, dict):
         raw = {}
@@ -200,6 +234,11 @@ def _normalize_lock_automation(raw) -> dict:
         "did": did,
         "unlock_action": unlock if unlock in _LOCK_ACTIONS else _LOCK_DEFAULTS["unlock_action"],
         "lock_action": lock if lock in _LOCK_ACTIONS else _LOCK_DEFAULTS["lock_action"],
+        "time_enabled": bool(raw.get("time_enabled", _LOCK_DEFAULTS["time_enabled"])),
+        "time_start": _normalize_hhmm(raw.get("time_start"), _LOCK_DEFAULTS["time_start"]),
+        "time_end": _normalize_hhmm(raw.get("time_end"), _LOCK_DEFAULTS["time_end"]),
+        "net_enabled": bool(raw.get("net_enabled", _LOCK_DEFAULTS["net_enabled"])),
+        "net_names": _normalize_net_names(raw.get("net_names")),
     }
 
 

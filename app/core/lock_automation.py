@@ -15,7 +15,10 @@
 - `_pending` 单飞行标志：解锁后 2 秒内又锁屏，只执行最后一次动作，
   不会把队列塞满（米家云端对高频写入会限流）；
 - 未登录（凭据失效）时静默跳过，登录流程由主窗口负责；
-- 配置关闭 / 未选设备 / 该方向设为「不操作」时直接跳过。
+- 配置关闭 / 未选设备 / 该方向设为「不操作」时直接跳过；
+- 生效时间段 / 生效网络条件（见 core/lock_conditions.py）在**任务线程**
+  内判定：网络查询是同步子进程（最长 5s），放在这里不会冻结界面；
+  条件不满足发 skipped 信号提示原因，不消耗设备控制。
 """
 
 import logging
@@ -23,6 +26,9 @@ import logging
 from PySide6.QtCore import QObject, Signal
 
 from app.core.jobs import PRIORITY_CONTROL
+from app.core.lock_conditions import (
+    current_network_names, in_time_window, match_network,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,7 @@ class LockAutomation(QObject):
         automation = LockAutomation(service, jobs, watcher)
         automation.state_applied.connect(main._apply_scheduled_state)
         automation.failed.connect(lambda msg: Toast.info(main, msg, 5000))
+        automation.skipped.connect(lambda msg: Toast.info(main, msg, 4000))
         # 登录完成后调用；设置对话框保存后调用 reload_config()
     """
 
@@ -41,6 +48,8 @@ class LockAutomation(QObject):
     state_applied = Signal(str, bool)
     # 失败信息（用户可读），由界面层决定如何提示
     failed = Signal(str)
+    # 条件未满足被跳过的原因（用户可读）；登录态缺失等静默跳过不发
+    skipped = Signal(str)
 
     def __init__(self, service, jobs, watcher, parent=None):
         super().__init__(parent)
@@ -87,20 +96,43 @@ class LockAutomation(QObject):
         if self._pending:
             logger.info("锁屏联控制在途，跳过本次%s事件", event)
             return
-        # 未登录时凭据无效，控制必然失败；静默跳过比弹错更安静
-        try:
-            if not self._service.login_status():
-                return
-        except Exception:
-            return
         turn_on = action == "on"
         logger.info("锁屏联动：%s → %s「%s」",
                     "锁屏" if event == "lock" else "解锁",
                     "打开" if turn_on else "关闭", did)
         self._pending = True
 
-        def _on_success(_result=None, d=did, on=turn_on):
+        def _work(d=did, on=turn_on, c=cfg):
+            # 条件门在任务线程执行：网络查询是同步子进程（最长 5s），
+            # 放主线程会冻结界面；时间判断虽轻也一并放这里统一处理。
+            # 返回 (kind, reason)：done=已控制 / skip=跳过（附原因）。
+            if c.get("time_enabled") and not in_time_window(
+                    c.get("time_start"), c.get("time_end")):
+                return ("skip", f"不在生效时段"
+                                f"（{c.get('time_start')}–{c.get('time_end')}）")
+            if c.get("net_enabled"):
+                names = current_network_names()
+                if not match_network(names, c.get("net_names")):
+                    if names:
+                        return ("skip", f"当前网络（{names[0]}）不在生效网络列表")
+                    return ("skip", "当前网络不可知，生效网络条件未满足")
+            # 未登录时凭据无效，控制必然失败；静默跳过比弹错更安静
+            try:
+                if not self._service.login_status():
+                    return ("skip", None)
+            except Exception:
+                return ("skip", None)
+            self._service.set_power_state(d, on)
+            return ("done", None)
+
+        def _on_success(result, d=did, on=turn_on):
             self._pending = False
+            kind, reason = result if isinstance(result, tuple) else ("done", None)
+            if kind == "skip":
+                if reason:
+                    logger.info("锁屏联动跳过：%s", reason)
+                    self.skipped.emit(reason)
+                return
             self.state_applied.emit(d, on)
 
         def _on_error(error, d=did, on=turn_on):
@@ -109,7 +141,7 @@ class LockAutomation(QObject):
             self.failed.emit(str(error))
 
         self._jobs.submit(
-            lambda d=did, on=turn_on: self._service.set_power_state(d, on),
+            _work,
             on_success=_on_success,
             on_error=_on_error,
             priority=PRIORITY_CONTROL,

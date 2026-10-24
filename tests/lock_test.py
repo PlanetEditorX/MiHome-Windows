@@ -2,10 +2,14 @@
 """锁屏联动回归测试（离屏）。
 
 锁死这些行为：
-1. settings.json 锁屏联动配置的存取与非法值收敛
+1. settings.json 锁屏联动配置的存取与非法值收敛（含生效时间/网络字段）
+1.5 生效条件纯函数：时间窗（普通/跨午夜/全天/边界/非法）、网络匹配
+    （包含/大小写/空名单放行/不可知拦截）、网络名输入解析
 2. 锁屏监听状态机：只有状态变化才发信号（重复通知去重、None 不发射）
 3. 联动执行：解锁开/锁屏关、none 方向不动作、未登录跳过、
    在途去重、失败发 failed 且 pending 清理（后续事件仍可执行）
+3.5+ 生效时间/网络条件门：未命中不控制但发 skipped 带原因；
+   网络命中（大小写不敏感包含）才执行；查询失败保守跳过
 4. 主窗口接线：组件存在、成功回写开关记忆、start 后轮询兜底在跑
 """
 
@@ -31,6 +35,8 @@ cfg = settings_store.get_lock_automation()
 assert cfg == {
     "enabled": False, "did": "",
     "unlock_action": "on", "lock_action": "off",
+    "time_enabled": False, "time_start": "08:00", "time_end": "23:00",
+    "net_enabled": False, "net_names": [],
 }, f"默认配置不符: {cfg}"
 
 settings_store.set_lock_automation(
@@ -38,6 +44,8 @@ settings_store.set_lock_automation(
 assert settings_store.get_lock_automation() == {
     "enabled": True, "did": "lamp1",
     "unlock_action": "off", "lock_action": "on",
+    "time_enabled": False, "time_start": "08:00", "time_end": "23:00",
+    "net_enabled": False, "net_names": [],
 }, "存取往返不一致"
 
 # 非法值一律收敛：did 非字符串按未选择，动作越界回落默认
@@ -47,12 +55,81 @@ bad = settings_store.get_lock_automation()
 assert bad["did"] == "" and bad["unlock_action"] == "on" and bad["lock_action"] == "off", \
     f"非法值未收敛: {bad}"
 
+# 生效时间非法 HH:MM 回落默认；网络名单过滤非字符串/去重/去空白
+settings_store.set_lock_automation({
+    "enabled": True, "did": "lamp1",
+    "time_start": "25:00", "time_end": "bad",
+    "net_names": ["ok", "", None, 5, "ok", "  spaced  "],
+})
+bad = settings_store.get_lock_automation()
+assert bad["time_start"] == "08:00" and bad["time_end"] == "23:00", \
+    f"非法时刻未收敛: {bad}"
+assert bad["net_names"] == ["ok", "spaced"], f"网络名单未收敛: {bad['net_names']}"
+
 # 非 dict / None 不炸，按默认配置处理
 settings_store.set_lock_automation("garbage")
 assert settings_store.get_lock_automation()["enabled"] is False
 settings_store.set_lock_automation(None)
 assert settings_store.get_lock_automation()["did"] == ""
 print("1. settings.json 锁屏联动配置存取/收敛 OK")
+
+# ---------- 1.5 生效条件纯函数（时间窗 / 网络匹配） ----------
+
+from datetime import datetime, timedelta
+
+from app.core.lock_conditions import (
+    format_hhmm, in_time_window, match_network, parse_hhmm, parse_network_text,
+)
+
+
+def _at(hour: int, minute: int) -> datetime:
+    return datetime(2026, 10, 25, hour, minute)
+
+
+# 普通窗 08:00–23:00：左闭右开
+assert in_time_window("08:00", "23:00", _at(8, 0)) is True
+assert in_time_window("08:00", "23:00", _at(7, 59)) is False
+assert in_time_window("08:00", "23:00", _at(22, 59)) is True
+assert in_time_window("08:00", "23:00", _at(23, 0)) is False
+# 跨午夜窗 23:00–06:00：晚于起点或早于终点
+assert in_time_window("23:00", "06:00", _at(23, 0)) is True
+assert in_time_window("23:00", "06:00", _at(23, 59)) is True
+assert in_time_window("23:00", "06:00", _at(0, 0)) is True
+assert in_time_window("23:00", "06:00", _at(5, 59)) is True
+assert in_time_window("23:00", "06:00", _at(6, 0)) is False
+assert in_time_window("23:00", "06:00", _at(12, 0)) is False
+# 起=止视为 24 小时全天
+assert in_time_window("09:00", "09:00", _at(3, 0)) is True
+assert in_time_window("09:00", "09:00", _at(23, 59)) is True
+# 任一端非法：不限制（防御分支，settings_store 已先行收敛）
+assert in_time_window("abc", "23:00", _at(12, 0)) is True
+assert in_time_window("08:00", "8:70", _at(12, 0)) is True
+
+# HH:MM 解析/格式化
+assert parse_hhmm("7:05") == (7, 5)
+assert parse_hhmm("07:05") == (7, 5)
+assert parse_hhmm("24:00") is None
+assert parse_hhmm("12:60") is None
+assert parse_hhmm("nope") is None
+assert parse_hhmm(None) is None
+assert format_hhmm("7:5") == "07:05"
+assert format_hhmm("bad") == "08:00"
+
+# 网络名单匹配：空名单/None 不限制；None 当前值保守拦截；大小写不敏感包含
+assert match_network(["CMCC-Home"], []) is True
+assert match_network(["CMCC-Home"], None) is True
+assert match_network(["CMCC-Home"], ["cmcc-home"]) is True
+assert match_network(["CMCC-8f3a"], ["CMCC"]) is True
+assert match_network(["ChinaNet-x"], ["CMCC"]) is False
+assert match_network(None, ["CMCC"]) is False
+assert match_network([], ["CMCC"]) is False
+
+# 网络名输入解析：中英文逗号/分号/换行分隔，去重保序
+assert parse_network_text("a, b，c;d\n e") == ["a", "b", "c", "d", "e"]
+assert parse_network_text(" a , a , b ") == ["a", "b"]
+assert parse_network_text("") == []
+assert parse_network_text(None) == []
+print("1.5 生效条件纯函数（时间窗/网络匹配/解析） OK")
 
 # ---------- 2. 监听状态机 ----------
 
@@ -121,16 +198,17 @@ class _FakeService:
 
 
 def _drain(jobs: _FakeJobs, service: _FakeService) -> None:
-    """按 JobExecutor 的语义执行在途任务：fn 异常走 on_error。"""
+    """按 JobExecutor 的语义执行在途任务：fn 异常走 on_error，
+    on_success 收到 fn 的返回值（条件门靠它回传 skip/done）。"""
     fn, on_success, on_error, _prio = jobs.tasks.pop(0)
     try:
-        fn()
+        ret = fn()
     except Exception as exc:  # noqa: BLE001 - 与 executor 的 worker 行为一致
         if on_error is not None:
             on_error(exc)
     else:
         if on_success is not None:
-            on_success(None)
+            on_success(ret)
 
 
 stub = _StubWatcher()
@@ -174,13 +252,19 @@ auto.reload_config()
 stub.unlocked.emit()
 assert jobs.tasks == [], "none 方向仍提交了任务"
 
-# 3.5 未登录（凭据失效）时静默跳过
+# 3.5 未登录（凭据失效）：守卫在任务线程内判定，静默跳过——
+# 任务会提交（条件/login 检查都在 fn 里），但不控制、不提示
 service._logged_in = False
 settings_store.set_lock_automation(
     {"enabled": True, "did": "lamp1", "unlock_action": "on", "lock_action": "off"})
 auto.reload_config()
+applied_before = len(applied)
+failures_before = len(failures)
 stub.unlocked.emit()
-assert jobs.tasks == [], "未登录时仍提交了任务"
+assert len(jobs.tasks) == 1, "未登录守卫应仍在任务内执行"
+_drain(jobs, service)
+assert len(applied) == applied_before and len(failures) == failures_before, \
+    "未登录时不应发成功/失败信号"
 service._logged_in = True
 
 # 3.6 失败：发 failed 且 pending 清理，后续事件仍可执行
@@ -207,6 +291,74 @@ assert len(jobs.tasks) == 1, f"在途事件未去重: {len(jobs.tasks)} 个任�
 _drain(jobs, service)
 assert service.calls[-1] == ("lamp1", True)
 print("3. 联动执行（语义/守卫/失败/去重） OK")
+
+# ---------- 3.5+ 生效时间/网络条件门 ----------
+# 条件在任务线程内判定（网络查询是同步子进程，不能冻结界面）；
+# 未命中时不控制设备，但发 skipped 信号让界面说明原因。
+
+import app.core.lock_automation as _la
+
+_now = datetime.now()
+skipped: list[str] = []
+auto.skipped.connect(skipped.append)
+
+# 3.8 生效时间：构造一个「此刻必定不命中」的跨午夜窗
+# （起点=此刻+1 分钟，终点=此刻-1 分钟 → 窗口在前后两侧，不含现在）
+settings_store.set_lock_automation({
+    "enabled": True, "did": "lamp1",
+    "unlock_action": "on", "lock_action": "off",
+    "time_enabled": True,
+    "time_start": (_now + timedelta(minutes=1)).strftime("%H:%M"),
+    "time_end": (_now - timedelta(minutes=1)).strftime("%H:%M"),
+})
+auto.reload_config()
+skipped.clear()
+calls_before = len(service.calls)
+stub.unlocked.emit()
+assert len(jobs.tasks) == 1, "时间条件应在任务内判定，任务要提交"
+_drain(jobs, service)
+assert len(service.calls) == calls_before, "时间条件未满足却控制了设备"
+assert skipped and "生效时段" in skipped[0], f"跳过原因未上报: {skipped}"
+
+# 3.9 生效网络：命中才执行；未命中/不可知都保守跳过
+_real_net = _la.current_network_names
+try:
+    settings_store.set_lock_automation({
+        "enabled": True, "did": "lamp1",
+        "unlock_action": "on", "lock_action": "off",
+        "time_enabled": False,
+        "net_enabled": True, "net_names": ["CMCC"],
+    })
+    auto.reload_config()
+
+    # 未命中：ChinaNet-x 不含 CMCC
+    _la.current_network_names = lambda: ["ChinaNet-x"]
+    skipped.clear()
+    calls_before = len(service.calls)
+    stub.unlocked.emit()
+    _drain(jobs, service)
+    assert len(service.calls) == calls_before and skipped, \
+        "网络未命中应跳过并上报原因"
+
+    # 命中：CMCC-8f3a 包含 CMCC（大小写不敏感）
+    _la.current_network_names = lambda: ["cmcc-8f3a"]
+    skipped.clear()
+    stub.unlocked.emit()
+    _drain(jobs, service)
+    assert service.calls[-1] == ("lamp1", True), "网络命中应正常执行"
+    assert not skipped, f"命中时不应跳过: {skipped}"
+
+    # 查询失败（None）：保守跳过
+    _la.current_network_names = lambda: None
+    skipped.clear()
+    calls_before = len(service.calls)
+    stub.unlocked.emit()
+    _drain(jobs, service)
+    assert len(service.calls) == calls_before and skipped, \
+        "网络不可知应保守跳过"
+finally:
+    _la.current_network_names = _real_net
+print("3.5+ 生效时间/网络条件门 OK")
 
 # ---------- 4. 主窗口接线 ----------
 

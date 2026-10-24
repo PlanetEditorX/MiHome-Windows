@@ -8,7 +8,7 @@
 替换带来的生硬变化。
 """
 
-from PySide6.QtCore import QEvent, QPropertyAnimation, QSize, Qt
+from PySide6.QtCore import QEvent, QPropertyAnimation, QSize, Qt, QTime
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QColorDialog,
@@ -17,8 +17,10 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +29,9 @@ import qtawesome as qta
 
 from app.core import board_store
 from app.core import settings_store
+from app.core.lock_conditions import (
+    current_network_names, parse_hhmm, parse_network_text,
+)
 from app.core.models import is_speaker
 from app.ui.overlay_dialog import OverlayDialog
 from app.ui.si_theme import (
@@ -34,10 +39,12 @@ from app.ui.si_theme import (
     SiColors,
     apply_combo_qss,
     primary_button_qss,
+    secondary_button_qss,
     themed_combo,
     themed_switch,
     themed_tab_button,
 )
+from app.ui.toast import Toast
 
 # 下拉文案 -> 设置值
 _THEME_MODE_LABELS = {"system": "跟随系统", "light": "浅色模式", "dark": "深色模式"}
@@ -60,6 +67,14 @@ _FADE_MS = 160
 # 锁屏联动：动作下拉文案 <-> 设置值（none=该方向不动作）
 _LOCK_ACTION_LABELS = {"on": "打开", "off": "关闭", "none": "不操作"}
 _LOCK_LABEL_TO_ACTION = {v: k for k, v in _LOCK_ACTION_LABELS.items()}
+
+
+def _parse_qtime(text: str) -> QTime:
+    """"HH:MM" -> QTime；非法回落 08:00（与 settings_store 归一化同语义）。"""
+    parsed = parse_hhmm(text)
+    if parsed is None:
+        return QTime(8, 0)
+    return QTime(parsed[0], parsed[1])
 
 
 def _sync_switch(switch) -> None:
@@ -462,6 +477,70 @@ class SettingsDialog(OverlayDialog):
             current=_LOCK_ACTION_LABELS.get(self._lock_cfg["lock_action"], "关闭"))
         lock_lock_row.addWidget(self._lock_lock_combo)
 
+        # 生效时间（子开关：开启后才受时段约束）
+        self._lock_time_item, self._lock_time_label, self._lock_time_desc, \
+            lock_time_row = self._make_item(
+                "生效时间", "开启后，只在下面设定的每日时段内响应锁屏/解锁；"
+                "关闭则全天响应")
+        self._lock_time_toggle = themed_switch()
+        self._lock_time_toggle.setChecked(self._lock_cfg["time_enabled"])
+        _sync_switch(self._lock_time_toggle)
+        lock_time_row.addWidget(self._lock_time_toggle)
+        self._lock_time_toggle.toggled.connect(self._on_lock_time_toggled)
+
+        # 生效时段（孙设置，依赖「生效时间」开关）
+        self._lock_span_item, self._lock_span_label, self._lock_span_desc, \
+            lock_span_row = self._make_item(
+                "生效时段", "每天的起止时刻，结束时刻为开区间；支持跨午夜"
+                "（如 23:00–06:00 表示仅夜间生效）；起=止视为全天")
+        span_host = QWidget()
+        span_layout = QHBoxLayout(span_host)
+        span_layout.setContentsMargins(0, 0, 0, 0)
+        span_layout.setSpacing(6)
+        self._lock_time_start = QTimeEdit()
+        self._lock_time_start.setDisplayFormat("HH:mm")
+        self._lock_time_start.setTime(
+            _parse_qtime(self._lock_cfg["time_start"]))
+        self._lock_time_end = QTimeEdit()
+        self._lock_time_end.setDisplayFormat("HH:mm")
+        self._lock_time_end.setTime(_parse_qtime(self._lock_cfg["time_end"]))
+        span_layout.addWidget(self._lock_time_start)
+        span_layout.addWidget(QLabel("–"))
+        span_layout.addWidget(self._lock_time_end)
+        lock_span_row.addWidget(span_host)
+
+        # 生效网络（子开关：开启后仅指定网络下响应）
+        self._lock_net_item, self._lock_net_label, self._lock_net_desc, \
+            lock_net_row = self._make_item(
+                "生效网络", "开启后，只在电脑连接到下面指定的网络时响应锁屏/解锁；"
+                "关闭则不限网络")
+        self._lock_net_toggle = themed_switch()
+        self._lock_net_toggle.setChecked(self._lock_cfg["net_enabled"])
+        _sync_switch(self._lock_net_toggle)
+        lock_net_row.addWidget(self._lock_net_toggle)
+        self._lock_net_toggle.toggled.connect(self._on_lock_net_toggled)
+
+        # 网络名称（孙设置，依赖「生效网络」开关）
+        self._lock_netname_item, self._lock_netname_label, self._lock_netname_desc, \
+            lock_netname_row = self._make_item(
+                "网络名称", "仅连接到这些网络时联动（WiFi 名即 SSID；多个名称用"
+                "逗号分隔，命中其一即生效）。点「当前」可一键填入当前网络名")
+        net_host = QWidget()
+        net_layout = QHBoxLayout(net_host)
+        net_layout.setContentsMargins(0, 0, 0, 0)
+        net_layout.setSpacing(6)
+        self._lock_net_edit = QLineEdit()
+        self._lock_net_edit.setPlaceholderText("例如：CMCC-Home, ChinaNet-8f3a")
+        self._lock_net_edit.setText(
+            ", ".join(self._lock_cfg["net_names"]))
+        self._lock_net_edit.setMinimumWidth(180)
+        self._lock_net_now = QPushButton("当前")
+        self._lock_net_now.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lock_net_now.clicked.connect(self._fill_current_network)
+        net_layout.addWidget(self._lock_net_edit, stretch=1)
+        net_layout.addWidget(self._lock_net_now)
+        lock_netname_row.addWidget(net_host)
+
         # ── 自动检测新版本 ──
         self._update_item, self._update_label, self._update_desc, update_row = self._make_item(
             "自动检测新版本",
@@ -477,6 +556,8 @@ class SettingsDialog(OverlayDialog):
             self._start_min_item, self._board_item, self._hide_item,
             self._lock_item, self._lock_device_item,
             self._lock_unlock_item, self._lock_lock_item,
+            self._lock_time_item, self._lock_span_item,
+            self._lock_net_item, self._lock_netname_item,
             self._update_item,
         ])
 
@@ -535,7 +616,9 @@ class SettingsDialog(OverlayDialog):
                      self._speaker_item, self._hide_item, self._scale_item,
                      self._update_item, self._board_item, self._accent_item,
                      self._lock_item, self._lock_device_item,
-                     self._lock_unlock_item, self._lock_lock_item):
+                     self._lock_unlock_item, self._lock_lock_item,
+                     self._lock_time_item, self._lock_span_item,
+                     self._lock_net_item, self._lock_netname_item):
             item.setStyleSheet(panel_card)
             # 高度按内容自适应（不固定）：长描述换行后行自然变高，
             # 不会被固定 64px 裁掉；短描述保持紧凑。QScrollArea 负责
@@ -548,7 +631,9 @@ class SettingsDialog(OverlayDialog):
                       self._speaker_label, self._hide_label, self._scale_label,
                       self._update_label, self._board_label, self._accent_label,
                       self._lock_label, self._lock_device_label,
-                      self._lock_unlock_label, self._lock_lock_label):
+                      self._lock_unlock_label, self._lock_lock_label,
+                      self._lock_time_label, self._lock_span_label,
+                      self._lock_net_label, self._lock_netname_label):
             label.setStyleSheet(
                 f"color: {SiColors.TEXT_PRIMARY}; background: transparent; font-size: 10pt;")
         for desc in (self._tray_desc, self._start_min_desc, self._fab_desc,
@@ -556,7 +641,9 @@ class SettingsDialog(OverlayDialog):
                      self._speaker_desc, self._hide_desc, self._scale_desc,
                      self._update_desc, self._board_desc, self._accent_desc,
                      self._lock_desc, self._lock_device_desc,
-                     self._lock_unlock_desc, self._lock_lock_desc):
+                     self._lock_unlock_desc, self._lock_lock_desc,
+                     self._lock_time_desc, self._lock_span_desc,
+                     self._lock_net_desc, self._lock_netname_desc):
             desc.setStyleSheet(
                 f"color: {SiColors.TEXT_SECONDARY}; background: transparent; font-size: 7pt;")
         # 主按钮文字固定白色（不随深/浅主题翻转）
@@ -571,6 +658,23 @@ class SettingsDialog(OverlayDialog):
                       self._lock_unlock_combo, self._lock_lock_combo):
             apply_combo_qss(combo)
             combo.set_arrow_color(SiColors.TEXT_SECONDARY)
+        # 生效时段/网络名称的输入类控件：内联样式为构造期求值，切主题重刷
+        input_qss = (
+            f"QTimeEdit, QLineEdit {{"
+            f" background: {SiColors.SURFACE};"
+            f" border: 1px solid {SiColors.LINE};"
+            f" border-radius: 8px; padding: 4px 8px;"
+            f" color: {SiColors.TEXT_PRIMARY}; font-size: 9pt; }}"
+            f"QTimeEdit:hover, QLineEdit:hover {{"
+            f" border-color: {SiColors.THEME}; }}"
+            f"QTimeEdit:disabled, QLineEdit:disabled {{"
+            f" color: {SiColors.TEXT_DISABLED}; }}"
+        )
+        for edit in (self._lock_time_start, self._lock_time_end,
+                     self._lock_net_edit):
+            edit.setStyleSheet(input_qss)
+        self._lock_net_now.setStyleSheet(
+            secondary_button_qss("3px 12px", font_size="9pt"))
         # 分类 tab 颜色随主题刷新（style_data 是构造期求值的内联色）
         for btn in self._tab_buttons:
             from PySide6.QtGui import QColor
@@ -753,6 +857,11 @@ class SettingsDialog(OverlayDialog):
                 self._lock_unlock_combo.currentText(), "on"),
             "lock_action": _LOCK_LABEL_TO_ACTION.get(
                 self._lock_lock_combo.currentText(), "off"),
+            "time_enabled": self._lock_time_toggle.isChecked(),
+            "time_start": self._lock_time_start.time().toString("HH:mm"),
+            "time_end": self._lock_time_end.time().toString("HH:mm"),
+            "net_enabled": self._lock_net_toggle.isChecked(),
+            "net_names": parse_network_text(self._lock_net_edit.text()),
         })
         board_store.set_enabled(self._board_toggle.isChecked())
         settings_store.set_show_scene_tab(self._scene_toggle.isChecked())
@@ -838,10 +947,11 @@ class SettingsDialog(OverlayDialog):
             self._start_min_toggle.setGraphicsEffect(eff)
 
     def _on_lock_toggled(self, enabled: bool) -> None:
-        """锁屏联动总开关变化时启用/禁用三个子设置项。
+        """锁屏联动总开关变化时启用/禁用全部子设置项。
 
-        子项是普通下拉框（QComboBox 原生支持置灰），只需同步文案配色；
-        开关控件才需要透明度灰化，这里不涉及。
+        子项是普通下拉框/输入框（QComboBox/QLineEdit 原生支持置灰），
+        只需同步文案配色；两个子开关（SiSwitchRefactor）自绘不响应
+        setEnabled，用透明度灰化。
         """
         label_color = SiColors.TEXT_PRIMARY if enabled else SiColors.TEXT_DISABLED
         desc_color = SiColors.TEXT_SECONDARY if enabled else SiColors.TEXT_FAINT
@@ -849,12 +959,60 @@ class SettingsDialog(OverlayDialog):
             (self._lock_device_label, self._lock_device_desc, self._lock_device_combo),
             (self._lock_unlock_label, self._lock_unlock_desc, self._lock_unlock_combo),
             (self._lock_lock_label, self._lock_lock_desc, self._lock_lock_combo),
+            (self._lock_span_label, self._lock_span_desc, self._lock_time_start),
+            (self._lock_span_label, self._lock_span_desc, self._lock_time_end),
+            (self._lock_netname_label, self._lock_netname_desc, self._lock_net_edit),
         ):
             label.setStyleSheet(
                 f"color: {label_color}; background: transparent; font-size: 10pt;")
             desc.setStyleSheet(
                 f"color: {desc_color}; background: transparent; font-size: 7pt;")
             control.setEnabled(enabled)
+        self._lock_net_now.setEnabled(enabled)
+        for toggle in (self._lock_time_toggle, self._lock_net_toggle):
+            if enabled:
+                toggle.setGraphicsEffect(None)
+            else:
+                eff = QGraphicsOpacityEffect(toggle)
+                eff.setOpacity(0.35)
+                toggle.setGraphicsEffect(eff)
+        # 孙控件跟随子开关状态
+        self._on_lock_time_toggled(
+            enabled and self._lock_time_toggle.isChecked())
+        self._on_lock_net_toggled(
+            enabled and self._lock_net_toggle.isChecked())
+
+    def _on_lock_time_toggled(self, enabled: bool) -> None:
+        """「生效时间」子开关：控制生效时段的两个时刻输入框。"""
+        self._lock_time_start.setEnabled(enabled)
+        self._lock_time_end.setEnabled(enabled)
+
+    def _on_lock_net_toggled(self, enabled: bool) -> None:
+        """「生效网络」子开关：控制网络名称输入框与「当前」按钮。"""
+        self._lock_net_edit.setEnabled(enabled)
+        self._lock_net_now.setEnabled(enabled)
+
+    def _fill_current_network(self) -> None:
+        """「当前」按钮：把当前网络名填入输入框（查询失败给 Toast）。"""
+        from PySide6.QtGui import QGuiApplication
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            names = current_network_names()
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+        if not names:
+            Toast.info(self, "无法获取当前网络名称（未连接或查询失败）", 3000)
+            return
+        name = names[0]
+        existing = parse_network_text(self._lock_net_edit.text())
+        if name not in existing:
+            existing.append(name)
+        self._lock_net_edit.setText(", ".join(existing))
+        if len(names) > 1:
+            Toast.info(self, f"已填入「{name}」；检测到 {len(names)} 个网络，"
+                             f"其余可在输入框手动补充", 3000)
+        else:
+            Toast.info(self, f"已填入当前网络「{name}」", 2500)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)

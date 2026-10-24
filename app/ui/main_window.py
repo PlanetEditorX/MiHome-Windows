@@ -269,6 +269,7 @@ class MainWindow(QMainWindow):
             self._service, self._jobs, self._lock_watcher, self)
         self._lock_automation.state_applied.connect(self._on_lock_state_applied)
         self._lock_automation.failed.connect(self._on_lock_failed)
+        self._lock_automation.skipped.connect(self._on_lock_skipped)
         self._lock_started = False
 
         # 右下角小爱语音悬浮球：设备列表里存在小爱音箱才显示
@@ -935,6 +936,10 @@ class MainWindow(QMainWindow):
         """联动控制失败（设备离线/被移除/凭据失效）：提示但不打断。"""
         logger.warning("锁屏联动执行失败: %s", message)
         Toast.info(self, f"锁屏联动执行失败：{message}", 5000)
+
+    def _on_lock_skipped(self, reason: str) -> None:
+        """生效时间/网络条件未满足：说明跳过原因，避免用户以为功能坏了。"""
+        Toast.info(self, f"锁屏联动已跳过：{reason}", 4000)
 
     def show_schedules(self) -> None:
         """打开定时任务对话框（托盘菜单与更多菜单共用入口）。"""
