@@ -2057,6 +2057,11 @@ class MainWindow(QMainWindow):
                 and not self.isMaximized() and not self.isMinimized()):
             w, h = self._expected_logical
             self._expected_logical = None
+            # 恢复变化前的逻辑尺寸，但不低于 minimumSize：跨屏到低
+            # DPI 屏幕时 Qt 保持物理尺寸重算逻辑尺寸，该路径不重新
+            # 钳制最小尺寸，窗口可能被压到 760×520 以下（v0.6.1 修复）
+            w = max(w, self.minimumWidth())
+            h = max(h, self.minimumHeight())
             QTimer.singleShot(0, lambda: (self.resize(w, h), self._clamp_to_screen()))
             self._last_dpr = dpr
         else:
@@ -2081,7 +2086,10 @@ class MainWindow(QMainWindow):
         avail = screen.availableGeometry()
         w, h = self.width(), self.height()
         if w > avail.width() or h > avail.height():
-            self.resize(min(w, avail.width()), min(h, avail.height()))
+            # 收窄到可用区域，但不低于 minimumSize：resize() 虽会自动
+            # 钳制，显式取下限可避免小屏上被压到最小逻辑尺寸以下
+            self.resize(max(min(w, avail.width()), self.minimumWidth()),
+                        max(min(h, avail.height()), self.minimumHeight()))
         # 位置 sanity：窗口完全落在屏幕外时拉回可见区域
         g = self.geometry()
         if (g.right() < avail.left() or g.left() > avail.right()

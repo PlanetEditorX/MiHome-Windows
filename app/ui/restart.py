@@ -15,12 +15,15 @@ import sys
 from PySide6.QtCore import QProcess
 
 
-def restart_app() -> None:
-    """退出当前进程并启动新实例；开发/打包形态均支持。"""
+def restart_app() -> bool:
+    """退出当前进程并启动新实例；开发/打包形态均支持。
+
+    返回 False 表示新进程没能起来（此时调用方不应退出旧进程）。
+    """
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance()
     if app is None:
-        return
+        return False
 
     args = sys.argv[:]
     executable, argv = _launch_command(args)
@@ -30,8 +33,10 @@ def restart_app() -> None:
     os.environ["MIHOME_RESTARTED"] = "1"
 
     # 先起新进程（不受旧进程锁影响），旧进程随即退出释放资源
-    QProcess.startDetached(executable, argv)
+    if not QProcess.startDetached(executable, argv):
+        return False
     app.quit()
+    return True
 
 
 def _launch_command(args: list[str]):

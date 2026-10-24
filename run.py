@@ -36,21 +36,88 @@ def _set_console_visible(visible: bool) -> None:
         pass
 
 
-# 基准界面缩放：整体 UI 在系统缩放之上再乘 1.25，作为软件的默认
-# 观感基线（即此前系统里 QT_SCALE_FACTOR=1.25 时的样子）；设置页的
-# 「界面缩放比例」是在此基准之上的个人微调乘数（默认 100%）。
-_BASE_UI_SCALE = 1.25
+# 界面缩放乘数：QT_SCALE_FACTOR 是在 Qt 原生 DPI 之上再乘的全局
+# 倍率，因此默认必须为 1.0——让每块屏幕跟随自己的系统缩放（200%
+# 屏 DPR 2.0、125% 屏 DPR 1.25）。曾在此基础上叠加 1.25 的观感
+# 基准，在 HiDPI 屏上产出 2.5×/1.5625× 的超大界面：窗口物理尺寸
+# 超出屏幕、与 Qt 逻辑尺寸失配，只显示出界面的碎片（v0.6.1 修复）。
+# 设置页的「界面缩放比例」是在此乘数之上的个人微调（默认 100%），
+# 想放大观感的用户可自行调高，不再内置基准。
+_BASE_UI_SCALE = 1.0
 
 
 def _apply_ui_scale_env() -> None:
-    """按「基准 1.25 × 设置乘数」写入 QT_SCALE_FACTOR。
+    """按「设置乘数 × DPI 校准系数」写入 QT_SCALE_FACTOR。
 
     必须在 QApplication 创建之前调用；Qt 只在初始化时读取该变量，
     更改后需重启生效。始终覆写：系统环境里可能残留外部设置的值，
     若不覆盖会与基准叠加导致界面异常巨大。
+
+    MIHOME_DPI_FACTOR 是 _dpi_calibration_factor() 检测到 Qt 误读
+    屏幕 DPI 时写入的一次性补偿系数，经重启继承（见其文档）。
     """
     from app.core.settings_store import get_ui_scale
-    os.environ["QT_SCALE_FACTOR"] = f"{_BASE_UI_SCALE * get_ui_scale():g}"
+    factor = float(os.environ.get("MIHOME_DPI_FACTOR", "1"))
+    os.environ["QT_SCALE_FACTOR"] = f"{_BASE_UI_SCALE * factor * get_ui_scale():g}"
+
+
+def _windows_primary_dpi() -> float | None:
+    """主监视器的 Windows 权威 DPI（折算成以 96 为 1.0 的倍率）。
+
+    取不到返回 None。这是系统里原生应用实际使用的缩放基准；
+    Qt 的 QScreen.devicePixelRatio 在个别环境（RDP 虚拟显示）下
+    会与它不一致，此时以本函数为准校准。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        shcore = ctypes.windll.shcore
+        point = wintypes.POINT(0, 0)
+        hmon = user32.MonitorFromPoint(point, 1)  # MONITOR_DEFAULTTOPRIMARY
+        if not hmon:
+            return None
+        dpi_x = wintypes.UINT()
+        dpi_y = wintypes.UINT()
+        if shcore.GetDpiForMonitor(hmon, 0, ctypes.byref(dpi_x),
+                                   ctypes.byref(dpi_y)) != 0:
+            return None
+        if dpi_x.value <= 0 or dpi_y.value <= 0:
+            return None
+        return (dpi_x.value + dpi_y.value) / 2 / 96.0
+    except Exception:
+        return None
+
+
+def _dpi_calibration_factor(app) -> float | None:
+    """检测 Qt 是否误读屏幕 DPI，返回需要的补偿系数（None = 正常）。
+
+    远程桌面（RDP）等虚拟显示环境下，Qt 6 会把 192 DPI 的屏幕读成
+    96（QScreen 几何尺寸正确、devicePixelRatio 恒为 1.0），界面整体
+    只有同屏原生应用的一半大小。Qt 的 DPR 是界面缩放与窗口物理尺寸
+    的唯一基准，读错时无任何本地设置可以纠正，只能用 Windows 权威
+    DPI 反推补偿系数，通过 QT_SCALE_FACTOR 乘回去。
+
+    只在「Qt 读数与 Windows 权威值整体成比例不一致」时校准；两者
+    一致（含本地多屏异构缩放，Qt 读取正常）时返回 None，不影响。
+    一次性：调用方把系数写入 MIHOME_DPI_FACTOR 并重启，新进程见到
+    该变量即跳过，不会循环重启。
+    """
+    if os.environ.get("MIHOME_DPI_FACTOR"):
+        return None
+    screen = app.primaryScreen()
+    if screen is None:
+        return None
+    qt_dpr = screen.devicePixelRatio()
+    win_dpr = _windows_primary_dpi()
+    if win_dpr is None or qt_dpr <= 0:
+        return None
+    if abs(qt_dpr - win_dpr) <= max(0.02, 0.02 * win_dpr):
+        return None
+    return win_dpr / qt_dpr
 
 
 def _install_qt_translator(app) -> None:
@@ -169,6 +236,18 @@ def main() -> int:
     app.setApplicationName("MiHome-Windows")
     app.setApplicationVersion(__version__)
     app.setQuitOnLastWindowClosed(False)
+
+    # DPI 校准：Qt 在 RDP 等虚拟显示环境下会误读屏幕 DPI（192 读成
+    # 96），界面只有同屏原生应用一半大且无本地设置可纠正。检测到
+    # 误读时带上补偿系数重启一次；本地多屏异构缩放下 Qt 读取正常，
+    # 此处为无操作。重启发起失败则撤掉系数按当前缩放继续运行
+    _calib_factor = _dpi_calibration_factor(app)
+    if _calib_factor is not None:
+        os.environ["MIHOME_DPI_FACTOR"] = f"{_calib_factor:g}"
+        from app.ui.restart import restart_app
+        if restart_app():
+            return 0
+        os.environ.pop("MIHOME_DPI_FACTOR", None)
 
     window = MainWindow()
 

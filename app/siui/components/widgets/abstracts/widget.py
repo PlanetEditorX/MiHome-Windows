@@ -1,5 +1,3 @@
-import os
-
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QWidget
@@ -326,7 +324,11 @@ class SiWidget(QWidget):
             return
 
         progress = self.animationGroup().fromToken("showing").current()
-        qt_scale_factor = float(os.environ["QT_SCALE_FACTOR"])
+        # 动画位图按控件当前所在屏幕的设备像素比渲染。不能再读
+        # QT_SCALE_FACTOR：那只是用户的界面微调乘数（默认 1.0），
+        # 并不等于有效 DPR；HiDPI 屏上按它渲染会把动画帧渲成低清
+        # 再放大（v0.6.1 修复）
+        qt_scale_factor = self.devicePixelRatioF() or 1.0
 
         scale_factor, opacity_factor = self.factor_func(progress)
 
