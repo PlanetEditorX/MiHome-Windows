@@ -91,7 +91,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release (custom notes)
-        if: ((github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true') || github.ref_type == 'tag') && steps.notes.outputs.custom == 'true'
+        if: ((github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true') || github.ref_type == 'tag') && steps.notes.outputs.custom == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
@@ -101,7 +101,7 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Publish GitHub Release (auto notes)
-        if: ((github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true') || github.ref_type == 'tag') && steps.notes.outputs.custom != 'true'
+        if: ((github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true') || github.ref_type == 'tag') && steps.notes.outputs.custom != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
