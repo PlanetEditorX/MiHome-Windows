@@ -902,6 +902,28 @@ class MainWindow(QMainWindow):
         self._lock_started = True
         self._lock_watcher.start()
         self._lock_automation.reload_config()
+        self._maybe_hint_lock_automation()
+
+    def _maybe_hint_lock_automation(self) -> None:
+        """功能默认关闭且无任何入口提示，用户容易以为「启动即生效」。
+
+        登录后若检测到未配置，引导一次前往设置开启（一次性，不重复打扰）。
+        """
+        try:
+            from app.core.settings_store import (
+                get_lock_automation, get_lock_automation_hinted,
+                set_lock_automation_hinted,
+            )
+            if get_lock_automation()["enabled"] or get_lock_automation_hinted():
+                return
+            set_lock_automation_hinted(True)
+            Toast.info(
+                self,
+                "新功能「锁屏联动」未开启：解锁电脑自动开灯、锁屏自动关灯，"
+                "可在 设置 → 应用功能 → 锁屏联动 中配置",
+                8000)
+        except Exception:
+            logger.debug("锁屏联动引导提示失败", exc_info=True)
 
     def _on_lock_state_applied(self, did: str, turn_on: bool) -> None:
         """联动控制成功：复用定时任务的界面回写，并Toast提示。"""

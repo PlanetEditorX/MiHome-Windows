@@ -218,6 +218,17 @@ def set_lock_automation(value) -> dict:
     return cfg
 
 
+def get_lock_automation_hinted() -> bool:
+    """「锁屏联动未配置」引导提示是否已展示过（只引导一次）。"""
+    return bool(_read_raw().get("lock_automation_hinted", False))
+
+
+def set_lock_automation_hinted(value: bool) -> None:
+    raw = _read_raw()
+    raw["lock_automation_hinted"] = bool(value)
+    _write_raw(raw)
+
+
 # 界面缩放档位（设置页下拉选项），范围 50%–200%
 UI_SCALES = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
 _UI_SCALE_MIN, _UI_SCALE_MAX = 0.5, 2.0

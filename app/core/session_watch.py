@@ -33,7 +33,10 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Signal
 logger = logging.getLogger(__name__)
 
 # ---- Windows 常量 ----
-WM_WTSSESSION_CHANGE = 0x02B1
+# WM_WTSSESSION_CHANGE = 0x02A8（WinUser.h）。注意勿与 0x02B1 混淆：
+# 写错的后果是过滤器永远等不到系统真实投递的消息，表现为「注册
+# 成功但收不到任何事件」，且测试若也用模块常量投递会自欺欺人。
+WM_WTSSESSION_CHANGE = 0x02A8
 WTS_SESSION_LOCK = 0x7
 WTS_SESSION_UNLOCK = 0x8
 NOTIFY_FOR_THIS_SESSION = 0

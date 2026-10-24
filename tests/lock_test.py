@@ -243,54 +243,25 @@ assert not win._lock_watcher._poll_timer.isActive(), "stop 后轮询仍在跑"
 assert win._lock_watcher.is_locked is None
 print("4. 主窗口接线 OK")
 
-# ---------- 5. WTS 消息管道（仅 Windows；模拟系统真实投递） ----------
-# 锁死这条链路：注册窗口 -> 应用级原生事件过滤 -> MSG 解析 -> 状态机。
-# 曾经踩过的坑：ctypes.wintypes.MSG 的句柄字段是 hWnd（大写 W），
-# 写成 msg.hwnd 会被 except 静默吞掉、表现为"注册成功但永远收不到事件"。
+# ---------- 5. WTS 消息管道（仅 Windows；子进程跑真实窗口子系统） ----------
+# 本文件顶部写死了 QT_QPA_PLATFORM=offscreen，而离屏平台 winId() 恒为 0、
+# WTS 注册必然失败——消息管道必须在真实窗口子系统里验证，因此拆到
+# tests/wts_pipeline_test.py 由子进程拉起（子进程不设 offscreen）。
+# 那条链路曾因 WM_WTSSESSION_CHANGE 误写成 0x02B1 而整体静默失效，
+# 且旧测试 import 错误常量投递消息、自欺欺人全绿；现已改为硬编码
+# SDK 权威值 + 常量守门断言。
 if is_supported():
-    import ctypes
-    import time
-    from ctypes import wintypes
+    import subprocess
+    import sys
 
-    from app.core.session_watch import (
-        WM_WTSSESSION_CHANGE,
-        WTS_SESSION_LOCK,
-        WTS_SESSION_UNLOCK,
-    )
-
-    wts_watcher = SessionLockWatcher()
-    wts_events: list[str] = []
-    wts_watcher.locked.connect(lambda: wts_events.append("locked"))
-    wts_watcher.unlocked.connect(lambda: wts_events.append("unlocked"))
-    wts_watcher.start()
-    if wts_watcher._wts_registered:  # 个别环境注册失败时跳过，轮询兜底不受影响
-        hwnd = wts_watcher.notify_hwnd()
-        user32 = ctypes.windll.user32
-        # PostMessage 走消息队列：与 Qt 原生事件过滤的取数路径一致
-        # （SendMessage 直达 WndProc，过滤层看不见，不能用来验证）
-        user32.PostMessageW(wintypes.HWND(hwnd), WM_WTSSESSION_CHANGE,
-                            WTS_SESSION_LOCK, 0)
-        for _ in range(10):
-            app.processEvents()
-            time.sleep(0.02)
-        assert wts_watcher.is_locked is True, "WTS 锁屏消息未驱动状态机"
-        user32.PostMessageW(wintypes.HWND(hwnd), WM_WTSSESSION_CHANGE,
-                            WTS_SESSION_UNLOCK, 0)
-        for _ in range(10):
-            app.processEvents()
-            time.sleep(0.02)
-        assert wts_watcher.is_locked is False, "WTS 解锁消息未驱动状态机"
-        user32.PostMessageW(wintypes.HWND(hwnd), WM_WTSSESSION_CHANGE,
-                            WTS_SESSION_LOCK, 0)
-        for _ in range(10):
-            app.processEvents()
-            time.sleep(0.02)
-        assert wts_events == ["locked", "unlocked", "locked"], \
-            f"WTS 消息管道异常: {wts_events}"
-        print("5. WTS 消息管道（注册/过滤/解析/状态机） OK")
-    else:
-        print("5. WTS 消息管道跳过（本环境注册失败，轮询兜底仍生效）")
-    wts_watcher.stop()
+    env = {k: v for k, v in os.environ.items()
+           if k != "QT_QPA_PLATFORM"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "tests.wts_pipeline_test"],
+        capture_output=True, text=True, timeout=120, env=env)
+    out = (proc.stdout + proc.stderr).strip()
+    assert proc.returncode == 0, f"WTS 管道子进程失败:\n{out}"
+    print(f"5. WTS 消息管道 {out}")
 else:
     print("5. WTS 消息管道跳过（非 Windows 平台）")
 
