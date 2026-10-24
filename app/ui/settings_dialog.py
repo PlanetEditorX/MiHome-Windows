@@ -57,6 +57,10 @@ _TAB_TITLES = ("主题界面", "应用功能")
 # 切页淡入时长：与主页房间切换同款
 _FADE_MS = 160
 
+# 锁屏联动：动作下拉文案 <-> 设置值（none=该方向不动作）
+_LOCK_ACTION_LABELS = {"on": "打开", "off": "关闭", "none": "不操作"}
+_LOCK_LABEL_TO_ACTION = {v: k for k, v in _LOCK_ACTION_LABELS.items()}
+
 
 def _sync_switch(switch) -> None:
     """siui 开关进度同步：setChecked 后须手动对齐动画内部 current。"""
@@ -167,6 +171,7 @@ class SettingsDialog(OverlayDialog):
         # 全部内联样式集中一处：构造与主题切换（retheme）共用
         self._apply_styles()
         self._on_tray_toggled(self._tray_toggle.isChecked())
+        self._on_lock_toggled(self._lock_toggle.isChecked())
         self._apply_voice_fab_state(self._has_speaker)
         self._apply_speaker_state(self._has_speaker)
         self._apply_autostart_state(self._autostart_supported)
@@ -404,6 +409,59 @@ class SettingsDialog(OverlayDialog):
         _sync_switch(self._hide_toggle)
         hide_row.addWidget(self._hide_toggle)
 
+        # ── 锁屏联动：锁屏/解锁时自动控制设备 ──
+        self._lock_cfg = settings_store.get_lock_automation()
+        self._lock_item, self._lock_label, self._lock_desc, lock_row = self._make_item(
+            "锁屏联动",
+            "解锁电脑时自动打开指定设备、锁屏时自动关闭（典型用法：台灯）。"
+            "需保持应用运行，可搭配「开机自启动」与「以系统托盘方式启动」静默常驻")
+        self._lock_toggle = themed_switch()
+        self._lock_toggle.setChecked(self._lock_cfg["enabled"])
+        _sync_switch(self._lock_toggle)
+        lock_row.addWidget(self._lock_toggle)
+        self._lock_toggle.toggled.connect(self._on_lock_toggled)
+
+        # 联动设备（子设置，依赖总开关）
+        self._lock_device_item, self._lock_device_label, self._lock_device_desc, \
+            lock_device_row = self._make_item(
+                "联动设备", "锁屏与解锁时自动开关哪台设备（建议选择台灯等开关类设备）")
+        lock_devices = sorted(
+            self._devices, key=lambda d: (0 if d.online else 1, d.name, d.did))
+        self._lock_device_options: list[tuple[str, str]] = [
+            ("", "请选择设备"),
+        ] + [(d.did, f"{d.name}（{d.room_name}）") for d in lock_devices]
+        cur_did = self._lock_cfg["did"]
+        cur_label = next(
+            (label for did, label in self._lock_device_options if did == cur_did),
+            self._lock_device_options[0][1],
+        )
+        self._lock_device_combo = themed_combo(
+            [label for _, label in self._lock_device_options], current=cur_label)
+        # 设备名含房间号可能较长：按最长选项文本自适应宽度，避免裁切
+        fm = self._lock_device_combo.fontMetrics()
+        option_labels = [label for _, label in self._lock_device_options]
+        text_w = max((fm.horizontalAdvance(t) for t in option_labels), default=120)
+        self._lock_device_combo.setFixedWidth(min(max(text_w + 48, 150), 300))
+        lock_device_row.addWidget(self._lock_device_combo)
+
+        # 解锁时动作（子设置）
+        self._lock_unlock_item, self._lock_unlock_label, self._lock_unlock_desc, \
+            lock_unlock_row = self._make_item(
+                "解锁时", "会话解锁后对「联动设备」执行的操作")
+        self._lock_unlock_combo = themed_combo(
+            [_LOCK_ACTION_LABELS[a] for a in ("on", "off", "none")],
+            current=_LOCK_ACTION_LABELS.get(self._lock_cfg["unlock_action"], "打开"))
+        lock_unlock_row.addWidget(self._lock_unlock_combo)
+
+        # 锁屏时动作（子设置）
+        self._lock_lock_item, self._lock_lock_label, self._lock_lock_desc, \
+            lock_lock_row = self._make_item(
+                "锁屏时", "会话锁屏后对「联动设备」执行的操作")
+        self._lock_lock_combo = themed_combo(
+            [_LOCK_ACTION_LABELS[a] for a in ("off", "on", "none")],
+            current=_LOCK_ACTION_LABELS.get(self._lock_cfg["lock_action"], "关闭"))
+        lock_lock_row.addWidget(self._lock_lock_combo)
+
         # ── 自动检测新版本 ──
         self._update_item, self._update_label, self._update_desc, update_row = self._make_item(
             "自动检测新版本",
@@ -417,6 +475,8 @@ class SettingsDialog(OverlayDialog):
         return self._build_scroll([
             self._autostart_item, self._speaker_item, self._tray_item,
             self._start_min_item, self._board_item, self._hide_item,
+            self._lock_item, self._lock_device_item,
+            self._lock_unlock_item, self._lock_lock_item,
             self._update_item,
         ])
 
@@ -473,7 +533,9 @@ class SettingsDialog(OverlayDialog):
         for item in (self._tray_item, self._start_min_item, self._fab_item,
                      self._scene_item, self._theme_item, self._autostart_item,
                      self._speaker_item, self._hide_item, self._scale_item,
-                     self._update_item, self._board_item, self._accent_item):
+                     self._update_item, self._board_item, self._accent_item,
+                     self._lock_item, self._lock_device_item,
+                     self._lock_unlock_item, self._lock_lock_item):
             item.setStyleSheet(panel_card)
             # 高度按内容自适应（不固定）：长描述换行后行自然变高，
             # 不会被固定 64px 裁掉；短描述保持紧凑。QScrollArea 负责
@@ -484,13 +546,17 @@ class SettingsDialog(OverlayDialog):
         for label in (self._tray_label, self._start_min_label, self._fab_label,
                       self._scene_label, self._theme_label, self._autostart_label,
                       self._speaker_label, self._hide_label, self._scale_label,
-                      self._update_label, self._board_label, self._accent_label):
+                      self._update_label, self._board_label, self._accent_label,
+                      self._lock_label, self._lock_device_label,
+                      self._lock_unlock_label, self._lock_lock_label):
             label.setStyleSheet(
                 f"color: {SiColors.TEXT_PRIMARY}; background: transparent; font-size: 10pt;")
         for desc in (self._tray_desc, self._start_min_desc, self._fab_desc,
                      self._scene_desc, self._theme_desc, self._autostart_desc,
                      self._speaker_desc, self._hide_desc, self._scale_desc,
-                     self._update_desc, self._board_desc, self._accent_desc):
+                     self._update_desc, self._board_desc, self._accent_desc,
+                     self._lock_desc, self._lock_device_desc,
+                     self._lock_unlock_desc, self._lock_lock_desc):
             desc.setStyleSheet(
                 f"color: {SiColors.TEXT_SECONDARY}; background: transparent; font-size: 7pt;")
         # 主按钮文字固定白色（不随深/浅主题翻转）
@@ -500,6 +566,11 @@ class SettingsDialog(OverlayDialog):
         # 界面缩放下拉同样随主题刷新（遗漏曾致切主题后仍保持旧深色样式）
         apply_combo_qss(self._scale_combo, editable=True)
         self._scale_combo.set_arrow_color(SiColors.TEXT_SECONDARY)
+        # 锁屏联动的三个下拉一并刷新，避免切主题后残留旧配色
+        for combo in (self._lock_device_combo,
+                      self._lock_unlock_combo, self._lock_lock_combo):
+            apply_combo_qss(combo)
+            combo.set_arrow_color(SiColors.TEXT_SECONDARY)
         # 分类 tab 颜色随主题刷新（style_data 是构造期求值的内联色）
         for btn in self._tab_buttons:
             from PySide6.QtGui import QColor
@@ -536,6 +607,7 @@ class SettingsDialog(OverlayDialog):
         super().retheme()
         self._apply_styles()
         self._on_tray_toggled(self._tray_toggle.isChecked())
+        self._on_lock_toggled(self._lock_toggle.isChecked())
         self._apply_voice_fab_state(self._has_speaker)
         self._apply_speaker_state(self._has_speaker)
         self._apply_autostart_state(self._autostart_supported)
@@ -669,6 +741,19 @@ class SettingsDialog(OverlayDialog):
         if self._devices:
             settings_store.set_voice_fab_enabled(self._voice_fab_toggle.isChecked())
         settings_store.set_hide_no_func_devices(self._hide_toggle.isChecked())
+        # 锁屏联动：整份配置写入（下拉文案反查设置值）；
+        # 未选设备时即使勾了启用也不会执行，下次打开设置仍保持勾选状态
+        lock_idx = self._lock_device_combo.currentIndex()
+        lock_did = (self._lock_device_options[lock_idx][0]
+                    if 0 <= lock_idx < len(self._lock_device_options) else "")
+        settings_store.set_lock_automation({
+            "enabled": self._lock_toggle.isChecked(),
+            "did": lock_did,
+            "unlock_action": _LOCK_LABEL_TO_ACTION.get(
+                self._lock_unlock_combo.currentText(), "on"),
+            "lock_action": _LOCK_LABEL_TO_ACTION.get(
+                self._lock_lock_combo.currentText(), "off"),
+        })
         board_store.set_enabled(self._board_toggle.isChecked())
         settings_store.set_show_scene_tab(self._scene_toggle.isChecked())
         settings_store.set_check_update_enabled(self._update_toggle.isChecked())
@@ -751,6 +836,25 @@ class SettingsDialog(OverlayDialog):
             eff = QGraphicsOpacityEffect(self._start_min_toggle)
             eff.setOpacity(0.35)
             self._start_min_toggle.setGraphicsEffect(eff)
+
+    def _on_lock_toggled(self, enabled: bool) -> None:
+        """锁屏联动总开关变化时启用/禁用三个子设置项。
+
+        子项是普通下拉框（QComboBox 原生支持置灰），只需同步文案配色；
+        开关控件才需要透明度灰化，这里不涉及。
+        """
+        label_color = SiColors.TEXT_PRIMARY if enabled else SiColors.TEXT_DISABLED
+        desc_color = SiColors.TEXT_SECONDARY if enabled else SiColors.TEXT_FAINT
+        for label, desc, control in (
+            (self._lock_device_label, self._lock_device_desc, self._lock_device_combo),
+            (self._lock_unlock_label, self._lock_unlock_desc, self._lock_unlock_combo),
+            (self._lock_lock_label, self._lock_lock_desc, self._lock_lock_combo),
+        ):
+            label.setStyleSheet(
+                f"color: {label_color}; background: transparent; font-size: 10pt;")
+            desc.setStyleSheet(
+                f"color: {desc_color}; background: transparent; font-size: 7pt;")
+            control.setEnabled(enabled)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)

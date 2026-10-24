@@ -34,6 +34,14 @@ _DEFAULTS: dict = {
     "ui_scale": 1.0,    # 界面缩放个人微调乘数（叠加在软件基准缩放之上），需重启生效
     "tray_columns": 2,  # 托盘快捷窗口卡片列数：1 或 2
     "check_update_enabled": True,  # 启动时自动检查 GitHub 新版本
+    # 锁屏联动：会话锁屏/解锁时自动开关指定设备（见 core/lock_automation.py）。
+    # 默认语义即最常见的用法：解锁开灯、锁屏关灯。
+    "lock_automation": {
+        "enabled": False,
+        "did": "",             # 目标设备 did；空串=尚未选择
+        "unlock_action": "on",  # 解锁时对该设备做什么：on / off / none
+        "lock_action": "off",   # 锁屏时对该设备做什么：on / off / none
+    },
 }
 
 
@@ -161,6 +169,53 @@ def set_check_update_enabled(value: bool) -> None:
     raw = _read_raw()
     raw["check_update_enabled"] = bool(value)
     _write_raw(raw)
+
+
+# ---------- 锁屏联动（会话锁屏/解锁时自动控制设备） ----------
+
+_LOCK_ACTIONS = ("on", "off", "none")
+_LOCK_DEFAULTS = {
+    "enabled": False,
+    "did": "",
+    "unlock_action": "on",
+    "lock_action": "off",
+}
+
+
+def _normalize_lock_automation(raw) -> dict:
+    """把磁盘/界面传入的配置收敛成合法结构；非法字段回落默认值。
+
+    动作只认 on / off / none（none=该方向不动作，例如只想关不想开）；
+    did 必须是字符串（设备 id），其余类型一律按未选择处理。
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    did = raw.get("did")
+    if not isinstance(did, str):
+        did = ""
+    unlock = raw.get("unlock_action")
+    lock = raw.get("lock_action")
+    return {
+        "enabled": bool(raw.get("enabled", _LOCK_DEFAULTS["enabled"])),
+        "did": did,
+        "unlock_action": unlock if unlock in _LOCK_ACTIONS else _LOCK_DEFAULTS["unlock_action"],
+        "lock_action": lock if lock in _LOCK_ACTIONS else _LOCK_DEFAULTS["lock_action"],
+    }
+
+
+def get_lock_automation() -> dict:
+    """读取锁屏联动配置（已规范化，字段必齐全）。"""
+    raw = _read_raw().get("lock_automation", {})
+    return _normalize_lock_automation(raw)
+
+
+def set_lock_automation(value) -> dict:
+    """整体写入锁屏联动配置，返回规范化后的实际落盘值。"""
+    cfg = _normalize_lock_automation(value)
+    raw = _read_raw()
+    raw["lock_automation"] = cfg
+    _write_raw(raw)
+    return cfg
 
 
 # 界面缩放档位（设置页下拉选项），范围 50%–200%

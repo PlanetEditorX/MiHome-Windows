@@ -41,9 +41,11 @@ import qtawesome as qta
 from app.core import cache as device_cache
 from app.core import icon_store, schedule_store
 from app.core.jobs import PRIORITY_CONTROL, PRIORITY_IDLE, JobExecutor
+from app.core.lock_automation import LockAutomation
 from app.core.models import DeviceInfo, SceneInfo, is_speaker
 from app.core.scheduler import Scheduler
 from app.core.service import MijiaService
+from app.core.session_watch import SessionLockWatcher
 from app.ui.board_manager import BoardManagerDialog
 from app.ui.device_card import DeviceCard
 from app.ui.device_dialog import DeviceDetailDialog
@@ -259,6 +261,15 @@ class MainWindow(QMainWindow):
         self._schedule_timer = QTimer(self)
         self._schedule_timer.setInterval(_SCHEDULE_INTERVAL_MS)
         self._schedule_timer.timeout.connect(self._on_schedule_tick)
+
+        # 锁屏联动：会话锁屏/解锁时按配置自动开关设备（见 core/lock_automation.py）。
+        # 与定时任务并列的常驻自动化：登录完成后启动，设置保存后热更新配置
+        self._lock_watcher = SessionLockWatcher(self)
+        self._lock_automation = LockAutomation(
+            self._service, self._jobs, self._lock_watcher, self)
+        self._lock_automation.state_applied.connect(self._on_lock_state_applied)
+        self._lock_automation.failed.connect(self._on_lock_failed)
+        self._lock_started = False
 
         # 右下角小爱语音悬浮球：设备列表里存在小爱音箱才显示
         self._voice_fab = VoiceFab(self)
@@ -724,6 +735,7 @@ class MainWindow(QMainWindow):
         self._poll_timer.start()
         self._metrics_timer.start()
         self._start_scheduler()
+        self._start_lock_automation()
         cached = device_cache.load()
         if cached is None:
             self.load_devices()
@@ -875,6 +887,32 @@ class MainWindow(QMainWindow):
                 self._board.apply_power_states({did: turn_on})
             except Exception:
                 pass
+
+    # ---------- 锁屏联动 ----------
+
+    def _start_lock_automation(self) -> None:
+        """登录完成、服务可用后启动锁屏监听。
+
+        监听本身双通道（WTS 通知 + 2s 轮询兜底），未配置时不会产生
+        任何控制，仅常驻一个轻量计时器；配置在启动时读一次，
+        设置对话框保存后由 show_settings 调 reload_config 热更新。
+        """
+        if self._lock_started:
+            return
+        self._lock_started = True
+        self._lock_watcher.start()
+        self._lock_automation.reload_config()
+
+    def _on_lock_state_applied(self, did: str, turn_on: bool) -> None:
+        """联动控制成功：复用定时任务的界面回写，并Toast提示。"""
+        self._apply_scheduled_state(did, turn_on)
+        name = next((d.name for d in self._all_devices if d.did == did), did[-6:])
+        Toast.info(self, f"锁屏联动：已{'打开' if turn_on else '关闭'}「{name}」", 3000)
+
+    def _on_lock_failed(self, message: str) -> None:
+        """联动控制失败（设备离线/被移除/凭据失效）：提示但不打断。"""
+        logger.warning("锁屏联动执行失败: %s", message)
+        Toast.info(self, f"锁屏联动执行失败：{message}", 5000)
 
     def show_schedules(self) -> None:
         """打开定时任务对话框（托盘菜单与更多菜单共用入口）。"""
@@ -1310,6 +1348,8 @@ class MainWindow(QMainWindow):
         from app.core.settings_store import get_minimize_to_tray
         if self._tray is not None:
             self._tray.set_tray_visible(get_minimize_to_tray())
+        # 「锁屏联动」配置可能刚被修改：热更新，下一次锁屏事件即按新配置执行
+        self._lock_automation.reload_config()
         # 「桌面挂件」开关可能刚被切换：立即生效（开启即显示、关闭即隐藏），
         # 同时刷新两个菜单里的挂件入口
         self._apply_board_enabled()
@@ -2220,6 +2260,11 @@ class MainWindow(QMainWindow):
         # 定时扫描随进程退出停止；规则本身已落盘，下次启动继续
         try:
             self._schedule_timer.stop()
+        except Exception:
+            pass
+        # 锁屏监听：WTS 注册必须显式注销，否则残留到会话结束
+        try:
+            self._lock_watcher.stop()
         except Exception:
             pass
         self._jobs.shutdown()
