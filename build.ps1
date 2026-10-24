@@ -331,6 +331,14 @@ Write-Host ("`n编译耗时 {0:00}:{1:00}" -f [int]$Elapsed.TotalMinutes, $Elaps
 # ============================================================
 if (Test-Path "dist\run.dist") {
     robocopy "dist\run.dist" "dist" /move /E /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
+    # robocopy 退出码 0-7 均为成功（1=复制了文件，2=额外文件，3=1+2...），
+    # >=8 才是真错误。且它的退出码会滞留在 $LASTEXITCODE 里——脚本
+    # 成功路径若不显式 exit 0，CI（GitHub Actions pwsh）会把 1 当失败，
+    # 表现为"构建成功但步骤红掉"
+    if ($LASTEXITCODE -ge 8) {
+        Write-Host "[ERROR] robocopy 整理输出失败（exit $LASTEXITCODE）" -ForegroundColor Red
+        exit 1
+    }
     Remove-Item "dist\run.build" -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -359,6 +367,9 @@ if (Test-Path $Exe) {
 
     $Size = [math]::Round((Get-Item $Exe).Length / 1MB, 1)
     Write-Host "`n构建成功! $Exe ($Size MB)" -ForegroundColor Green
+    # 显式成功退出码：防止 $LASTEXITCODE 里滞留的 robocopy(1)/其它
+    # 原生命令退出码被 CI 当作失败
+    exit 0
 } else {
     Write-Host "[ERROR] 找不到输出文件" -ForegroundColor Red
     exit 1
