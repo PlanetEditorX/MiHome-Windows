@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（如 0.5.0，打包为 MiHome-Windows-v<version>-win64.zip）"
+        description: "版本号（如 0.6.0，打包为 MiHome-Windows-v<version>-win64.zip）"
         required: true
-        default: "0.5.0"
+        default: "0.6.0"
       publish_release:
         description: "构建成功后创建/更新 GitHub Release 并上传 zip"
         type: boolean
@@ -55,6 +55,22 @@ jobs:
             echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           fi
 
+      # 自定义 Release notes：放置 .github/release-notes/<tag>.md 即优先使用，
+      # 否则回退 GitHub 按提交记录自动生成
+      - name: Resolve release notes
+        id: notes
+        shell: bash
+        run: |
+          tag="${{ steps.ver.outputs.tag }}"
+          if [ -f ".github/release-notes/$tag.md" ]; then
+            echo "custom=true" >> "$GITHUB_OUTPUT"
+            echo "path=.github/release-notes/$tag.md" >> "$GITHUB_OUTPUT"
+            echo "using custom notes: .github/release-notes/$tag.md"
+          else
+            echo "custom=false" >> "$GITHUB_OUTPUT"
+            echo "no custom notes, fallback to auto-generated"
+          fi
+
       - name: Build (Nuitka + MSVC)
         shell: pwsh
         run: .\build.ps1
@@ -74,8 +90,18 @@ jobs:
           path: MiHome-Windows-*-win64.zip
           if-no-files-found: error
 
-      - name: Publish GitHub Release
-        if: (github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true') || github.ref_type == 'tag'
+      - name: Publish GitHub Release (custom notes)
+        if: ((github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true') || github.ref_type == 'tag') && steps.notes.outputs.custom == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: MiHome-Windows ${{ steps.ver.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.path }}
+          files: MiHome-Windows-*-win64.zip
+          fail_on_unmatched_files: true
+
+      - name: Publish GitHub Release (auto notes)
+        if: ((github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true') || github.ref_type == 'tag') && steps.notes.outputs.custom != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
