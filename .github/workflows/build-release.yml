@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 MiHome-Windows contributors
+name: Build Release
+
+on:
+  # 手动触发：填版本号 → 编译 → 打包 → 挂到 v<version> Release
+  # （GitHub 的 windows-latest runner 自带 MSVC + Windows SDK，
+  #  本地无需安装 Visual Studio 即可产出 exe）
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 0.5.0，打包为 MiHome-Windows-v<version>-win64.zip）"
+        required: true
+        default: "0.5.0"
+      publish_release:
+        description: "构建成功后创建/更新 GitHub Release 并上传 zip"
+        type: boolean
+        default: true
+  # 推 v* tag 时自动编译并发布
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Nuitka standalone build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # build.ps1 检测到 .venv 已存在会跳过自建 venv（内部用 py -3，
+      # 版本不可控）；这里用 setup-python 指定的解释器预建并装好依赖，
+      # 脚本随后直接进入 MSVC/Nuitka 流程
+      - name: Prepare virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e .
+
+      - name: Resolve release tag
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (Nuitka + MSVC)
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Package dist as zip
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $name = "MiHome-Windows-$tag-win64.zip"
+          if (Test-Path $name) { Remove-Item $name }
+          Compress-Archive -Path dist\* -DestinationPath $name -CompressionLevel Optimal
+          Get-Item $name | ForEach-Object { "packaged: $($_.Name) ($([math]::Round($_.Length/1MB,1)) MB)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MiHome-Windows-${{ steps.ver.outputs.tag }}-win64
+          path: MiHome-Windows-*-win64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: (github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true') || github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: MiHome-Windows ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: MiHome-Windows-*-win64.zip
+          fail_on_unmatched_files: true
