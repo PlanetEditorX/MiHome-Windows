@@ -238,7 +238,8 @@ class SettingsDialog(OverlayDialog):
         return scroll
 
     def _build_appearance_page(self) -> QScrollArea:
-        """主题界面：主题配色、界面缩放比例、小爱悬浮对话按钮、场景选项卡。"""
+        """主题界面：主题配色、界面缩放比例、小爱悬浮对话按钮、场景选项卡、
+        隐藏离线设备。"""
         # ── 主题配色下拉（跟随系统 / 浅色 / 深色） ──
         self._theme_item, self._theme_label, self._theme_desc, theme_row = self._make_item(
             "主题配色",
@@ -332,9 +333,21 @@ class SettingsDialog(OverlayDialog):
         _sync_switch(self._scene_toggle)
         scene_row.addWidget(self._scene_toggle)
 
+        # ── 隐藏离线设备 ──
+        self._offline_item, self._offline_label, self._offline_desc, offline_row = \
+            self._make_item(
+                "隐藏离线设备",
+                "当前离线的设备不在主页与托盘快捷面板中显示，设备重新上线后自动"
+                "出现；打开设置项（如默认指挥的音箱、锁屏联动）时仍可看到全部设备。"
+                "桌面挂件不受影响")
+        self._offline_toggle = themed_switch()
+        self._offline_toggle.setChecked(settings_store.get_hide_offline_devices())
+        _sync_switch(self._offline_toggle)
+        offline_row.addWidget(self._offline_toggle)
+
         return self._build_scroll([
             self._theme_item, self._accent_item, self._scale_item,
-            self._fab_item, self._scene_item,
+            self._fab_item, self._scene_item, self._offline_item,
         ])
 
     def _build_features_page(self) -> QScrollArea:
@@ -615,6 +628,7 @@ class SettingsDialog(OverlayDialog):
                      self._scene_item, self._theme_item, self._autostart_item,
                      self._speaker_item, self._hide_item, self._scale_item,
                      self._update_item, self._board_item, self._accent_item,
+                     self._offline_item,
                      self._lock_item, self._lock_device_item,
                      self._lock_unlock_item, self._lock_lock_item,
                      self._lock_time_item, self._lock_span_item,
@@ -630,6 +644,7 @@ class SettingsDialog(OverlayDialog):
                       self._scene_label, self._theme_label, self._autostart_label,
                       self._speaker_label, self._hide_label, self._scale_label,
                       self._update_label, self._board_label, self._accent_label,
+                      self._offline_label,
                       self._lock_label, self._lock_device_label,
                       self._lock_unlock_label, self._lock_lock_label,
                       self._lock_time_label, self._lock_span_label,
@@ -640,6 +655,7 @@ class SettingsDialog(OverlayDialog):
                      self._scene_desc, self._theme_desc, self._autostart_desc,
                      self._speaker_desc, self._hide_desc, self._scale_desc,
                      self._update_desc, self._board_desc, self._accent_desc,
+                     self._offline_desc,
                      self._lock_desc, self._lock_device_desc,
                      self._lock_unlock_desc, self._lock_lock_desc,
                      self._lock_time_desc, self._lock_span_desc,
@@ -845,6 +861,7 @@ class SettingsDialog(OverlayDialog):
         if self._devices:
             settings_store.set_voice_fab_enabled(self._voice_fab_toggle.isChecked())
         settings_store.set_hide_no_func_devices(self._hide_toggle.isChecked())
+        settings_store.set_hide_offline_devices(self._offline_toggle.isChecked())
         # 锁屏联动：整份配置写入（下拉文案反查设置值）；
         # 未选设备时即使勾了启用也不会执行，下次打开设置仍保持勾选状态
         lock_idx = self._lock_device_combo.currentIndex()

@@ -222,6 +222,10 @@ class MainWindow(QMainWindow):
         # 隐藏无可控制功能的设备（设置开关，默认关）
         from app.core.settings_store import get_hide_no_func_devices
         self._hide_no_func = get_hide_no_func_devices()
+        # 隐藏离线设备（设置开关，默认关）：主页网格与托盘快捷面板不展示
+        # 当前不可达的设备，重新上线后自动出现
+        from app.core.settings_store import get_hide_offline_devices
+        self._hide_offline = get_hide_offline_devices()
         # 场景选项卡（设置开关，默认开）与场景视图状态：
         # _scenes 为 None 表示尚未加载，空列表为「确认无场景」
         from app.core.settings_store import get_show_scene_tab
@@ -1402,6 +1406,10 @@ class MainWindow(QMainWindow):
             self._rebuild_grid()
             self._update_count_label()
             self._update_tray_devices()
+        # “隐藏离线设备”开关可能变化：主页网格与托盘快捷面板同步收放。
+        # 房间 tab 不重建——房间集合仍按全量设备统计，避免设备上下线
+        # 时 tab 来回跳动（离线隐藏后某房间可能暂时为空，由网格空态说明）
+        self._apply_hide_offline_setting()
         # “显示场景选项卡”开关可能变化：重载选项卡并刷新网格；
         # 关闭时若正停留在场景视图，重置回全屋，避免入口消失后无法切回
         from app.core.settings_store import get_show_scene_tab
@@ -1415,6 +1423,21 @@ class MainWindow(QMainWindow):
             self._update_count_label()
         # 同步小爱悬浮按钮显隐
         self._update_voice_fab()
+
+    def _apply_hide_offline_setting(self) -> None:
+        """重读「隐藏离线设备」开关并刷新展示（设置保存后热更新）。
+
+        不重建房间 tab：房间集合按全量设备统计，设备上下线时 tab 不跳动；
+        离线设备被隐藏后某房间可能暂时无卡片，由网格空态文案说明。
+        """
+        from app.core.settings_store import get_hide_offline_devices
+        new_offline = get_hide_offline_devices()
+        if new_offline == self._hide_offline:
+            return
+        self._hide_offline = new_offline
+        self._rebuild_grid()
+        self._update_count_label()
+        self._update_tray_devices()
 
     def _update_voice_fab(self) -> None:
         """根据设置与设备列表决定小爱悬浮按钮显隐。
@@ -1511,8 +1534,13 @@ class MainWindow(QMainWindow):
         self._light_pill.setText(f"开启 {lights}")
         self._light_pill.setVisible(lights > 0)
 
-        # 耗材跟随当前家庭/房间归属，不再用全屋口径
-        low = sum(1 for item in self._consumables_in_scope(subset) if item.get("low"))
+        # 耗材跟随当前家庭/房间归属，不再用全屋口径。
+        # 展示开关不参与（include_hidden=True）：设备被折叠展示不该让
+        # 「耗材不足」静默消失，详情列表与这里必须同口径否则数量对不上
+        low = sum(
+            1 for item in self._consumables_in_scope(
+                self._visible_subset(include_hidden=True))
+            if item.get("low"))
         self._consumable_low = low
         self._consumable_pill.setText(f"耗材不足 {low}")
         self._consumable_pill.setVisible(low > 0)
@@ -1530,12 +1558,13 @@ class MainWindow(QMainWindow):
         self._consumable_low = sum(1 for item in self._consumables if item.get("low"))
         self._update_count_label()
 
-    def _visible_subset(self) -> list[DeviceInfo]:
-        """当前家庭 + 房间筛选后的设备列表（统计与明细共用）。"""
-        visible = self._visible_devices()
-        if self._current_home == _ALL_HOMES:
-            return visible
-        return [d for d in visible if d.home_name == self._current_home]
+    def _visible_subset(self, *, include_hidden: bool = False) -> list[DeviceInfo]:
+        """当前家庭 + 房间筛选后的设备列表（统计与明细共用）。
+
+        家庭/房间过滤已在 `_visible_devices` 内完成；include_hidden 透传
+        展示开关语义（True=忽略「隐藏离线 / 隐藏无功能」）。
+        """
+        return self._visible_devices(include_hidden=include_hidden)
 
     def _open_status_panel(self, title: str, subtitle: str, groups) -> None:
         """打开状态明细面板（胶囊点击的统一入口）。"""
@@ -1584,9 +1613,11 @@ class MainWindow(QMainWindow):
 
         耗材接口返回的是设备英文名（如 mijia E-toothbrush t700），
         这里用 did 对齐设备列表，统一显示界面里已有的中文名。
-        subset 由调用方传入可省掉一次可见设备遍历。
+        subset 由调用方传入可省掉一次可见设备遍历；默认口径忽略展示
+        开关——耗材不足是更换提醒，设备被隐藏展示时也不能漏报。
         """
-        devices = subset if subset is not None else self._visible_subset()
+        devices = (subset if subset is not None
+                   else self._visible_subset(include_hidden=True))
         lookup = {d.did: d for d in devices}
         result = []
         for item in self._consumables:
@@ -1798,24 +1829,46 @@ class MainWindow(QMainWindow):
         if self._all_devices:
             device_cache.save(self._all_devices, self._known_power, self._metrics)
 
-    def _visible_devices(self) -> list[DeviceInfo]:
+    def _visible_devices(self, *, include_hidden: bool = False) -> list[DeviceInfo]:
+        """当前家庭 + 房间范围内的设备，默认已应用展示开关过滤。
+
+        include_hidden=True 时跳过「隐藏无功能 / 隐藏离线」两个展示开关：
+        耗材统计等聚合口径用它，否则设备被折叠展示后耗材不足会静默漏报。
+        """
         return [
             d for d in self._all_devices
             if (self._current_home == _ALL_HOMES or d.home_name == self._current_home)
             and (self._current_room == _ALL_ROOMS or d.room_name == self._current_room)
-            and (not self._hide_no_func or self._device_has_functions(d))
+            and (include_hidden or self._device_displayable(d))
         ]
+
+    def _device_displayable(self, device: DeviceInfo) -> bool:
+        """展示开关过滤：隐藏离线设备 / 隐藏无可控制功能的设备。"""
+        if self._hide_offline and not device.online:
+            return False
+        return not self._hide_no_func or self._device_has_functions(device)
 
     def _device_has_functions(self, device: DeviceInfo) -> bool:
         """None（spec 未拉取）视为有——等首轮轮询证实后再隐藏。"""
         state = self._service.spec_has_published_functions(device.spec_type)
         return state is not False
 
+    def _empty_grid_hint(self) -> str:
+        """空网格提示：区分「本来就没设备」与「被展示开关隐藏」。"""
+        hidden = self._visible_devices(include_hidden=True)
+        if not hidden:
+            return "当前范围内暂无设备"
+        if self._hide_offline and all(not d.online for d in hidden):
+            return "当前范围内没有在线设备（可在设置中关闭「隐藏离线设备」）"
+        return "当前范围内没有可显示的设备（可在设置中调整隐藏项）"
+
     def _displayed_devices(self) -> list[DeviceInfo]:
-        """主页/托盘展示列表（含家庭/房间过滤与“隐藏无功能设备”）。"""
-        if not self._hide_no_func:
-            return self._all_devices
-        return [d for d in self._all_devices if self._device_has_functions(d)]
+        """主页/托盘展示列表：全部家庭/房间口径 + 展示开关过滤。
+
+        托盘快捷面板与主页共用这两个展示开关；桌面挂件不参与——
+        它是用户手动挑选的常驻面板（见 _update_board_devices）。
+        """
+        return [d for d in self._all_devices if self._device_displayable(d)]
 
     def _show_home_menu(self) -> None:
         if not self._homes:
@@ -1952,6 +2005,16 @@ class MainWindow(QMainWindow):
             self._visible_devices(),
             key=lambda d: (0 if d.online else 1, d.name),
         )
+        if not visible:
+            # 空态：常见于「隐藏离线设备」开启后某房间只剩离线设备。
+            # 不提示的话用户会以为列表加载失败
+            hint = QLabel(self._empty_grid_hint())
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hint.setFont(QFont("Microsoft YaHei UI", 12))
+            hint.setStyleSheet(
+                f"color: {SiColors.TEXT_MUTED}; background: transparent;")
+            self._grid.addWidget(hint, 0, 0)
+            return
         cols = self._columns_for_width(self._scroll.viewport().width())
         self._grid_columns = cols
         rows = (len(visible) + cols - 1) // cols

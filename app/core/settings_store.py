@@ -25,6 +25,10 @@ _DEFAULTS: dict = {
     # 由 ui/si_theme.set_accent 统一计算，这里只存用户选的那个值。
     "theme_accent": "",
     "hide_no_func_devices": False,
+    # 隐藏离线设备：离线（当前不可达）的设备不在主页网格与托盘快捷面板
+    # 中显示，重新上线后自动出现。桌面挂件不受影响——挂件是用户手动
+    # 挑选的常驻面板，选中项消失会被当成故障。
+    "hide_offline_devices": False,
     "show_scene_tab": True,  # 主页选项卡最左侧显示「场景」入口（手动场景一键执行）
     "default_speaker_did": "",  # 小爱指令默认输出音箱；空串=自动（第一个在线）
     # 托盘音响栏正在控制哪台音箱。与 default_speaker_did 刻意分开：
@@ -139,6 +143,17 @@ def get_hide_no_func_devices() -> bool:
 def set_hide_no_func_devices(value: bool) -> None:
     raw = _read_raw()
     raw["hide_no_func_devices"] = bool(value)
+    _write_raw(raw)
+
+
+def get_hide_offline_devices() -> bool:
+    """是否隐藏离线设备（主页网格与托盘快捷面板），默认关闭。"""
+    return bool(_read_raw().get("hide_offline_devices", False))
+
+
+def set_hide_offline_devices(value: bool) -> None:
+    raw = _read_raw()
+    raw["hide_offline_devices"] = bool(value)
     _write_raw(raw)
 
 
