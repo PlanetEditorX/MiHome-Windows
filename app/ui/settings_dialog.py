@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
-    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -45,6 +44,7 @@ from app.ui.si_theme import (
     themed_tab_button,
 )
 from app.ui.toast import Toast
+from app.ui.time_field import TimeField
 
 # 下拉文案 -> 设置值
 _THEME_MODE_LABELS = {"system": "跟随系统", "light": "浅色模式", "dark": "深色模式"}
@@ -510,15 +510,15 @@ class SettingsDialog(OverlayDialog):
         span_layout = QHBoxLayout(span_host)
         span_layout.setContentsMargins(0, 0, 0, 0)
         span_layout.setSpacing(6)
-        self._lock_time_start = QTimeEdit()
-        self._lock_time_start.setDisplayFormat("HH:mm")
-        self._lock_time_start.setTime(
-            _parse_qtime(self._lock_cfg["time_start"]))
-        self._lock_time_end = QTimeEdit()
-        self._lock_time_end.setDisplayFormat("HH:mm")
-        self._lock_time_end.setTime(_parse_qtime(self._lock_cfg["time_end"]))
+        self._lock_time_start = TimeField(_parse_qtime(self._lock_cfg["time_start"]))
+        self._lock_time_end = TimeField(_parse_qtime(self._lock_cfg["time_end"]))
         span_layout.addWidget(self._lock_time_start)
-        span_layout.addWidget(QLabel("–"))
+        span_arrow = QLabel("→")
+        span_arrow.setStyleSheet(
+            f"color: {SiColors.TEXT_SECONDARY}; background: transparent;"
+            " font-size: 9pt;")
+        span_arrow.setToolTip("起 → 止")
+        span_layout.addWidget(span_arrow)
         span_layout.addWidget(self._lock_time_end)
         lock_span_row.addWidget(span_host)
 
@@ -674,21 +674,20 @@ class SettingsDialog(OverlayDialog):
                       self._lock_unlock_combo, self._lock_lock_combo):
             apply_combo_qss(combo)
             combo.set_arrow_color(SiColors.TEXT_SECONDARY)
-        # 生效时段/网络名称的输入类控件：内联样式为构造期求值，切主题重刷
+        # 生效时段的时间字段自带主题上色（内部 QTimeEdit + 自绘步进按钮）
+        for field in (self._lock_time_start, self._lock_time_end):
+            field.apply_theme()
+        # 网络名称输入框：内联样式为构造期求值，切主题重刷
         input_qss = (
-            f"QTimeEdit, QLineEdit {{"
+            f"QLineEdit {{"
             f" background: {SiColors.SURFACE};"
             f" border: 1px solid {SiColors.LINE};"
             f" border-radius: 8px; padding: 4px 8px;"
             f" color: {SiColors.TEXT_PRIMARY}; font-size: 9pt; }}"
-            f"QTimeEdit:hover, QLineEdit:hover {{"
-            f" border-color: {SiColors.THEME}; }}"
-            f"QTimeEdit:disabled, QLineEdit:disabled {{"
-            f" color: {SiColors.TEXT_DISABLED}; }}"
+            f"QLineEdit:hover {{ border-color: {SiColors.THEME}; }}"
+            f"QLineEdit:disabled {{ color: {SiColors.TEXT_DISABLED}; }}"
         )
-        for edit in (self._lock_time_start, self._lock_time_end,
-                     self._lock_net_edit):
-            edit.setStyleSheet(input_qss)
+        self._lock_net_edit.setStyleSheet(input_qss)
         self._lock_net_now.setStyleSheet(
             secondary_button_qss("3px 12px", font_size="9pt"))
         # 分类 tab 颜色随主题刷新（style_data 是构造期求值的内联色）
