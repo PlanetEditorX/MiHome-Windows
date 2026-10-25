@@ -103,6 +103,12 @@ def _dpi_calibration_factor(app) -> float | None:
 
     只在「Qt 读数与 Windows 权威值整体成比例不一致」时校准；两者
     一致（含本地多屏异构缩放，Qt 读取正常）时返回 None，不影响。
+
+    比较前必须先除掉 QT_SCALE_FACTOR：QScreen.devicePixelRatio() 是
+    乘过该变量的最终值，而它同时承载用户的「界面缩放比例」微调。
+    若不除，用户把缩放设成 150% 时 200% 屏会读到 3.0，被误判成 Qt
+    误读并自动重启，重启后用户设置会被校准系数抵消掉。
+
     一次性：调用方把系数写入 MIHOME_DPI_FACTOR 并重启，新进程见到
     该变量即跳过，不会循环重启。
     """
@@ -111,7 +117,13 @@ def _dpi_calibration_factor(app) -> float | None:
     screen = app.primaryScreen()
     if screen is None:
         return None
-    qt_dpr = screen.devicePixelRatio()
+    try:
+        injected = float(os.environ.get("QT_SCALE_FACTOR", "1") or 1)
+    except ValueError:
+        injected = 1.0
+    if injected <= 0:
+        injected = 1.0
+    qt_dpr = screen.devicePixelRatio() / injected  # Qt 自己的原生读数
     win_dpr = _windows_primary_dpi()
     if win_dpr is None or qt_dpr <= 0:
         return None
