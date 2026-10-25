@@ -3,9 +3,13 @@
 # Copyright (C) 2026 MiHome-Windows contributors
 """设置窗口：无边框可拖拽面板 + 背部暗色遮罩，与设备详情页同款观感。
 
-设置项按「主题界面 / 应用功能」两分类展示：标题下方的横向 tab 切换
-分类，内容区切页时做整体淡入过渡（与主页切换房间同款），避免直接
-替换带来的生硬变化。
+设置项按「主题界面 / 应用功能 / 锁屏联动」三分类展示：标题下方的横向
+tab 切换分类，内容区切页时做整体淡入过渡（与主页切换房间同款），避免
+直接替换带来的生硬变化。
+
+锁屏联动单独成页而非并入「应用功能」：它带 7 个从属参数（设备、两个
+动作、生效时间/时段、生效网络/网络名），占那一页近一半高度，混在开关
+列表里会让整页滚到两屏。拆开后两页都刚好一屏内，找起来也更直接。
 """
 
 from PySide6.QtCore import QEvent, QPropertyAnimation, QSize, Qt, QTime
@@ -59,8 +63,8 @@ _ACCENT_PRESETS: tuple[tuple[str, str], ...] = (
     ("蓝色", "#39a6d8"),
 )
 
-_TAB_APPEARANCE, _TAB_FEATURES = 0, 1
-_TAB_TITLES = ("主题界面", "应用功能")
+_TAB_APPEARANCE, _TAB_FEATURES, _TAB_LOCK = 0, 1, 2
+_TAB_TITLES = ("主题界面", "应用功能", "锁屏联动")
 # 切页淡入时长：与主页房间切换同款
 _FADE_MS = 160
 
@@ -84,9 +88,9 @@ def _sync_switch(switch) -> None:
 
 
 class _PagesHost(QWidget):
-    """叠放两页的容器：尺寸变化时把两页同步铺满，保持完全重叠。
+    """叠放多页的容器：尺寸变化时把各页同步铺满，保持完全重叠。
 
-    两页刻意不进布局而是绝对定位，同一时刻只有一页可见，切换即
+    各页刻意不进布局而是绝对定位，同一时刻只有一页可见，切换即
     hide/show + 新页淡入。
     """
 
@@ -124,7 +128,7 @@ class SettingsDialog(OverlayDialog):
         # 分类展示后单项行更少，面板放大到主窗口约八成，减少滚动
         if parent is not None:
             pw = max(720, int(parent.width() * 0.78))
-            ph = max(520, int(parent.height() * 0.82))
+            ph = max(520, int(parent.height() * 0.85))
         else:
             pw, ph = 720, 520
         panel.setFixedSize(pw, ph)
@@ -171,8 +175,10 @@ class SettingsDialog(OverlayDialog):
 
         self._appearance_scroll = self._build_appearance_page()
         self._features_scroll = self._build_features_page()
-        self._pages_host.add_page(self._appearance_scroll)
-        self._pages_host.add_page(self._features_scroll)
+        self._lock_scroll = self._build_lock_page()
+        for page in (self._appearance_scroll, self._features_scroll,
+                     self._lock_scroll):
+            self._pages_host.add_page(page)
 
         # ---- 底部按钮 ----
         btn_row = QHBoxLayout()
@@ -215,13 +221,17 @@ class SettingsDialog(OverlayDialog):
         row.addLayout(texts, stretch=1)
         return item, label, desc_label, row
 
-    def _build_scroll(self, items: list[QFrame]) -> QScrollArea:
-        """一组设置项卡片装进滚动区：项数增多/高缩放时滚动代替裁切。"""
+    def _build_scroll(self, items: list[QFrame], spacing: int = 8) -> QScrollArea:
+        """一组设置项卡片装进滚动区：项数增多/高缩放时滚动代替裁切。
+
+        spacing 默认 8；项数多的整页（锁屏联动 8 项）用 6 换一点高度，
+        让那一页也落在不用滚动的一屏内。
+        """
         host = QWidget()
         host.setStyleSheet("background: transparent;")
         body = QVBoxLayout(host)
         body.setContentsMargins(8, 6, 8, 0)
-        body.setSpacing(8)
+        body.setSpacing(spacing)
         for item in items:
             body.addWidget(item)
         body.addStretch(1)
@@ -351,7 +361,11 @@ class SettingsDialog(OverlayDialog):
         ])
 
     def _build_features_page(self) -> QScrollArea:
-        """应用功能：开机自启动、默认指挥的音箱、系统托盘、托盘方式启动、隐藏无功能设备。"""
+        """应用功能：开机自启动、默认指挥的音箱、系统托盘、托盘方式启动、
+        桌面挂件、隐藏无功能设备、自动检测更新。
+
+        锁屏联动不在此页——它有 7 个从属参数，单独成页（见 _build_lock_page）。
+        """
         # ── 开机自启动（写注册表 HKCU Run，默认关闭） ──
         self._autostart_item, self._autostart_label, self._autostart_desc, autostart_row = \
             self._make_item("开机自启动", "")
@@ -437,6 +451,28 @@ class SettingsDialog(OverlayDialog):
         _sync_switch(self._hide_toggle)
         hide_row.addWidget(self._hide_toggle)
 
+        # ── 自动检测新版本 ──
+        self._update_item, self._update_label, self._update_desc, update_row = self._make_item(
+            "自动检测新版本",
+            "开启时，会在每次启动应用时自动从 Github 仓库获取新版本信息，"
+            "有则提示更新")
+        self._update_toggle = themed_switch()
+        self._update_toggle.setChecked(settings_store.get_check_update_enabled())
+        _sync_switch(self._update_toggle)
+        update_row.addWidget(self._update_toggle)
+
+        return self._build_scroll([
+            self._autostart_item, self._speaker_item, self._tray_item,
+            self._start_min_item, self._board_item, self._hide_item,
+            self._update_item,
+        ])
+
+    def _build_lock_page(self) -> QScrollArea:
+        """锁屏联动页：锁屏/解锁时自动控制哪台设备、在什么条件下生效。
+
+        从「应用功能」页拆出来单独成页：这里有总开关加 7 个从属参数，
+        混在开关列表里会把那一页撑到近两屏。
+        """
         # ── 锁屏联动：锁屏/解锁时自动控制设备 ──
         self._lock_cfg = settings_store.get_lock_automation()
         self._lock_item, self._lock_label, self._lock_desc, lock_row = self._make_item(
@@ -554,25 +590,12 @@ class SettingsDialog(OverlayDialog):
         net_layout.addWidget(self._lock_net_now)
         lock_netname_row.addWidget(net_host)
 
-        # ── 自动检测新版本 ──
-        self._update_item, self._update_label, self._update_desc, update_row = self._make_item(
-            "自动检测新版本",
-            "开启时，会在每次启动应用时自动从 Github 仓库获取新版本信息，"
-            "有则提示更新")
-        self._update_toggle = themed_switch()
-        self._update_toggle.setChecked(settings_store.get_check_update_enabled())
-        _sync_switch(self._update_toggle)
-        update_row.addWidget(self._update_toggle)
-
         return self._build_scroll([
-            self._autostart_item, self._speaker_item, self._tray_item,
-            self._start_min_item, self._board_item, self._hide_item,
             self._lock_item, self._lock_device_item,
             self._lock_unlock_item, self._lock_lock_item,
             self._lock_time_item, self._lock_span_item,
             self._lock_net_item, self._lock_netname_item,
-            self._update_item,
-        ])
+        ], spacing=6)
 
     # ---------- 分类切换 ----------
 
@@ -594,8 +617,11 @@ class SettingsDialog(OverlayDialog):
 
     def _show_tab(self, index: int, animated: bool) -> None:
         """切页：直接替换后新页整体淡入（与主页房间切换同款观感）。"""
-        pages = (self._appearance_scroll, self._features_scroll)
-        pages[1 - index].hide()
+        pages = (self._appearance_scroll, self._features_scroll,
+                 self._lock_scroll)
+        for i, page in enumerate(pages):
+            if i != index:
+                page.hide()
         incoming = pages[index]
         # 清掉可能残留的旧效果，避免快速连续切换时叠在新一轮动画上
         incoming.setGraphicsEffect(None)
