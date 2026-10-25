@@ -6,14 +6,20 @@
 与关于页/设置页同一套扁平化观感：无边框圆角面板、遮罩、淡入淡出。
 更新日志直接取 release 正文，用 QTextDocument 的 Markdown 渲染器展示，
 标题/列表/粗体/行内代码/链接这些常用语法都能正常呈现。
+
+更新动作分两条路：打包运行且 release 带 win64 资产时，「立即更新」
+在对话框内下载并替换安装目录后自动重启；否则（源码运行、或该版本
+没挂资产）主按钮退回「前往下载」，打开浏览器由用户手动处理。
 """
 
-from PySide6.QtCore import QSize, QUrl, Qt
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QTextBrowser,
     QVBoxLayout,
@@ -22,6 +28,7 @@ from PySide6.QtWidgets import (
 import qtawesome as qta
 
 from app import __version__
+from app.core import updater
 from app.ui.overlay_dialog import OverlayDialog
 from app.ui.si_theme import (
     PRIMARY_TEXT,
@@ -29,6 +36,7 @@ from app.ui.si_theme import (
     primary_button_qss,
     secondary_button_qss,
 )
+from app.ui.toast import Toast
 
 _PANEL_W = 480
 _PANEL_H = 520
@@ -93,6 +101,20 @@ class UpdateDialog(OverlayDialog):
         lay.addWidget(self._notes, stretch=1)
         self._render_notes()
 
+        # ---- 更新进度：默认隐藏，点「立即更新」后出现 ----
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(5)
+        self._progress.setVisible(False)
+        lay.addWidget(self._progress)
+
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setVisible(False)
+        lay.addWidget(self._status)
+
         # ---- 底部按钮 ----
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
@@ -101,13 +123,23 @@ class UpdateDialog(OverlayDialog):
         self._later_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._later_btn.clicked.connect(self.reject)
         btn_row.addWidget(self._later_btn)
-        self._download_btn = QPushButton(" 前往下载")
+        # 文案随「能否自更新」而定：能就地装就写「立即更新」，
+        # 否则保持「前往下载」，不做无谓的承诺
+        self._self_update = updater.can_self_update(info)
+        self._download_btn = QPushButton(
+            " 立即更新" if self._self_update else " 前往下载")
         self._download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._download_btn.setIconSize(QSize(18, 18))
-        self._download_btn.clicked.connect(self._open_download)
+        self._download_btn.clicked.connect(self._start_update)
+        if self._self_update and info.asset_size:
+            # 在按下之前就让用户知道要下多少、之后会发生什么
+            self._download_btn.setToolTip(
+                f"下载约 {info.asset_size / 1048576:.0f} MB，"
+                "完成后自动重启应用")
         btn_row.addWidget(self._download_btn)
         lay.addLayout(btn_row)
 
+        self._downloader = None
         self._apply_styles()
 
     # ---------- 内容 ----------
@@ -148,6 +180,76 @@ class UpdateDialog(OverlayDialog):
         QDesktopServices.openUrl(QUrl(self._info.url))
         self.accept()
 
+    # ---------- 应用内更新 ----------
+
+    def _start_update(self) -> None:
+        """主按钮：能就地更新就下载安装，否则退回打开下载页。"""
+        if not self._self_update or updater.install_dir() is None:
+            self._open_download()
+            return
+        self._download_btn.setEnabled(False)
+        self._download_btn.setText(" 更新中…")
+        self._later_btn.setEnabled(False)
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+        self._set_status("正在下载更新包…")
+        self._downloader = updater.UpdateDownloader(self._info.asset_url, self)
+        self._downloader.progress.connect(self._on_progress)
+        self._downloader.finished.connect(self._on_downloaded)
+        self._downloader.start()
+
+    def _on_progress(self, done: int, total: int) -> None:
+        mb = 1024 * 1024
+        if total > 0:
+            self._progress.setValue(min(100, int(done * 100 / total)))
+            self._set_status(
+                f"正在下载更新包… {done / mb:.1f} / {total / mb:.1f} MB")
+        else:
+            self._set_status(f"正在下载更新包… {done / mb:.1f} MB")
+
+    def _on_downloaded(self, staging, error) -> None:
+        if error is not None:
+            self._restore_after_failure(f"更新失败：{error}")
+            return
+        dest = updater.install_dir()
+        if dest is None:
+            self._restore_after_failure("当前不是安装版，无法自动更新")
+            return
+        try:
+            updater.apply_update(staging, dest)
+        except Exception as exc:
+            self._restore_after_failure(f"无法启动更新程序：{exc}")
+            return
+        self._progress.setValue(100)
+        self._set_status("更新已就绪，应用即将重启完成安装…")
+        self._download_btn.setText(" 重启中…")
+        # 留一小段时间让用户看清状态，再把进程交给外部脚本收尾
+        QTimer.singleShot(600, self._quit_for_update)
+
+    def _quit_for_update(self) -> None:
+        """关闭对话框并退出进程：替换脚本要等本进程退出后才能覆盖 exe。"""
+        self.accept()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _restore_after_failure(self, message: str) -> None:
+        """下载/替换失败：把界面还原成可重试状态并说明原因。"""
+        if self._downloader is not None:
+            self._downloader.deleteLater()
+            self._downloader = None
+        self._download_btn.setEnabled(True)
+        self._download_btn.setText(
+            " 立即更新" if self._self_update else " 前往下载")
+        self._later_btn.setEnabled(True)
+        self._progress.setVisible(False)
+        self._status.setVisible(False)
+        Toast.info(self, message, 5000)
+
+    def _set_status(self, text: str) -> None:
+        self._status.setText(text)
+        self._status.setVisible(True)
+
     # ---------- 样式 ----------
 
     def _apply_styles(self) -> None:
@@ -179,6 +281,14 @@ class UpdateDialog(OverlayDialog):
             " { background: none; }")
         self._later_btn.setStyleSheet(secondary_button_qss("8px 20px"))
         self._download_btn.setStyleSheet(primary_button_qss("8px 20px"))
+        self._progress.setStyleSheet(
+            f"QProgressBar {{ background: {SiColors.WINDOW_BG};"
+            " border: none; border-radius: 2px; }"
+            f"QProgressBar::chunk {{ background: {SiColors.THEME};"
+            " border-radius: 2px; }}")
+        self._status.setStyleSheet(
+            f"color: {SiColors.TEXT_SECONDARY}; background: transparent;"
+            " font-size: 9pt;")
         # 主按钮文字固定白色，图标也要同色；ON_THEME_TEXT 在浅色强调色下是深色
         self._download_btn.setIcon(
             qta.icon("mdi.download", color=PRIMARY_TEXT))

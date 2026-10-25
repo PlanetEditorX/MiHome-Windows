@@ -362,8 +362,11 @@ class MainWindow(QMainWindow):
         self._board_toggle_action = QAction("隐藏桌面挂件", self._more_menu)
         self._board_toggle_action.triggered.connect(self.toggle_board_visible)
         self._more_menu.addAction(self._board_toggle_action)
-        # 「关于」固定在菜单最底部
+        # 「关于」固定在菜单最底部；检测更新放在同一组里，主界面
+        # 一键可达（此前只有关于页里有这个按钮）
         self._more_menu.addSeparator()
+        self._more_menu.addAction("检测更新").triggered.connect(
+            self._check_update_manually)
         self._more_menu.addAction("关于").triggered.connect(self.show_about)
         self._more_btn = _IconButton("mdi.dots-horizontal", "更多", self)
         self._more_btn.clicked.connect(self._show_more_menu)
@@ -699,6 +702,16 @@ class MainWindow(QMainWindow):
             check_update(self, manual=False)
 
         QTimer.singleShot(3000, self, _run)
+
+    def _check_update_manually(self) -> None:
+        """「更多 → 检测更新」：与启动检查共用链路，但无论如何都回显结果。
+
+        自动检查受「启动时自动检查更新」开关约束，手动入口不受限——
+        用户主动点就该有明确反馈，包括「已是最新」与失败原因。
+        """
+        from app.ui.update_flow import check_update
+
+        check_update(self, manual=True)
 
     def _after_login_check(self, logged_in: bool) -> None:
         if logged_in:
@@ -2040,6 +2053,13 @@ class MainWindow(QMainWindow):
             avail = screen.availableGeometry()
             self.move(avail.center().x() - self.width() // 2,
                       avail.center().y() - self.height() // 2)
+            # 上次应用内更新若没能覆盖成功，脚本会留下标记：首次显示后
+            # 补一句提示（延迟到窗口可见，Toast 才有正确的宿主位置）
+            from PySide6.QtCore import QTimer as _QTimer
+
+            from app.ui.update_flow import notify_pending_update_failure
+            _QTimer.singleShot(
+                1200, self, lambda: notify_pending_update_failure(self))
         # 托盘常驻启动/唤出：隐藏期间积压的网格重建在此执行
         if self._grid_dirty:
             self._rebuild_grid()

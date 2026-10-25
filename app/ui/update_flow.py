@@ -46,3 +46,27 @@ def prompt_new_version(parent, info) -> None:
         dlg.exec()
     finally:
         dlg.deleteLater()
+
+
+def notify_pending_update_failure(parent) -> None:
+    """上次应用内更新没成功时提示一次。
+
+    替换脚本覆盖失败（文件被占用、目录无写权限）后仍会启动应用，
+    否则用户面对的就是「程序不见了」；但那样看起来像更新成功了。
+    脚本会在 %TEMP% 留标记，这里读一次、提示、清掉，避免反复打扰。
+    """
+    from app.core import updater
+
+    marker = updater.failure_flag_path()
+    try:
+        if not marker.exists():
+            return
+        marker.unlink()
+    except OSError:
+        return
+    Toast.info(
+        parent,
+        "上次更新未完成（文件可能被占用或权限不足），请退出后重试"
+        "或到 GitHub 手动下载",
+        6000,
+    )

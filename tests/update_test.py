@@ -87,6 +87,105 @@ plain_light = dlg._notes.toPlainText()
 assert "桌面挂件" in plain_light, "切换主题后更新日志丢失"
 print("5. 主题切换重渲染 OK")
 
+# ---------- 6. 资产挑选：只认 win64 zip ----------
+from app.core.update_checker import _pick_asset
+
+assets = [
+    # GitHub 会自动附带源码 zip，名字同样以 .zip 结尾——必须被排除
+    {"name": "Source code (zip)", "browser_download_url": "https://x/src.zip",
+     "size": 100},
+    {"name": "MiHome-Windows-v0.6.1-win64.zip",
+     "browser_download_url": "https://x/ok.zip", "size": 79710824},
+    {"name": "checksums.txt", "browser_download_url": "https://x/sums.txt",
+     "size": 64},
+]
+url, name, size = _pick_asset(assets)
+assert url == "https://x/ok.zip", url
+assert name == "MiHome-Windows-v0.6.1-win64.zip", name
+assert size == 79710824, size
+# 无资产 / 字段缺失时全部回空，界面据此回退「前往下载」
+assert _pick_asset([]) == ("", "", 0)
+assert _pick_asset(None) == ("", "", 0)
+assert _pick_asset([{"name": "a-win64.zip"}]) == ("", "", 0)
+print("6. 资产挑选 OK")
+
+# ---------- 7. 打包态：主按钮变「立即更新」，进度区默认隐藏 ----------
+from pathlib import Path
+
+from app.core import updater
+
+_orig_install_dir = updater.install_dir
+updater.install_dir = lambda: Path(r"C:\fake\install")
+try:
+    info_asset = ReleaseInfo(
+        tag="v0.6.1", url="https://example.com", name="v0.6.1", body="x",
+        asset_url="https://x/ok.zip",
+        asset_name="MiHome-Windows-v0.6.1-win64.zip", asset_size=79710824)
+    dlg3 = UpdateDialog(info_asset, None)
+    dlg3.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    dlg3.show()
+    app.processEvents()
+    assert dlg3._self_update is True, "有 win64 资产应支持应用内更新"
+    assert dlg3._download_btn.text().strip() == "立即更新", \
+        dlg3._download_btn.text()
+    # 进度条与状态文字在点击前不该占位
+    assert dlg3._progress.isHidden(), "进度条应默认隐藏"
+    assert dlg3._status.isHidden(), "状态文字应默认隐藏"
+    dlg3.done(0)
+finally:
+    updater.install_dir = _orig_install_dir
+app.processEvents()
+print("7. 打包态主按钮 OK")
+
+# ---------- 8. 更新脚本模板 ----------
+script = updater._SCRIPT_TEMPLATE.format(
+    src=r"D:\tmp\staging", dst=r"C:\app", exe=updater.EXE_NAME,
+    flag=updater.FAILURE_FLAG)
+# cmd 代码页随系统而变，脚本必须能编成纯 ASCII，否则中文乱码会被当命令执行
+script.encode("ascii")
+for token in ("tasklist", "robocopy", "start \"\"", "rd /s /q", "del \"%~f0\""):
+    assert token in script, f"脚本缺少关键步骤: {token}"
+assert r'"%DST%\%EXE%"' in script, "启动路径拼接错误"
+# 覆盖失败要留标记，否则「更新失败」在用户眼里等于「更新成功」
+assert updater.FAILURE_FLAG in script, "缺少失败标记写入"
+assert updater.failure_flag_path().name == updater.FAILURE_FLAG
+print("8. 更新脚本模板 OK")
+
+# ---------- 9. 主界面手动入口 + 失败标记 ----------
+from app.ui.main_window import MainWindow
+
+win = MainWindow()
+actions = [a.text() for a in win._more_menu.actions()]
+assert "检测更新" in actions, f"「更多」菜单缺少检测更新: {actions}"
+# 固定在「关于」之上，与其它低频项同组
+assert actions.index("检测更新") < actions.index("关于"), actions
+
+# 手动入口不受「启动时自动检查更新」开关约束
+from app.core import settings_store
+
+import app.ui.update_flow as flow
+
+settings_store.set_check_update_enabled(False)
+called = {}
+_orig_check = flow.check_update
+flow.check_update = lambda parent, manual: called.update(
+    parent=parent, manual=manual)
+try:
+    win._check_update_manually()
+finally:
+    flow.check_update = _orig_check
+    settings_store.set_check_update_enabled(True)
+assert called.get("manual") is True, f"手动入口应传 manual=True: {called}"
+assert called.get("parent") is win
+
+# 更新失败标记：提示一次即清除，第二次静默
+flag = updater.failure_flag_path()
+flag.write_text("x", encoding="utf-8")
+flow.notify_pending_update_failure(win)
+assert not flag.exists(), "失败标记应在提示后清除"
+flow.notify_pending_update_failure(win)  # 无标记时应不抛异常
+print("9. 手动入口与失败标记 OK")
+
 dlg.done(0)
 dlg2.done(0)
 app.processEvents()

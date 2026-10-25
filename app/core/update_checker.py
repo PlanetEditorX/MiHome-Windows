@@ -29,6 +29,36 @@ class ReleaseInfo:
     body: str = ""
     # ISO 8601 发布时间，展示时只取日期
     published_at: str = ""
+    # 打包产物（CI 产出的 win64 zip）的下载地址与元信息；release 未挂
+    # 资产（如早期版本或只在网页发布）时三者都为空/0，此时界面回退到
+    # 「打开浏览器下载页」，应用内更新不可用
+    asset_url: str = ""
+    asset_name: str = ""
+    asset_size: int = 0
+
+
+def _pick_asset(assets) -> tuple[str, str, int]:
+    """从 release 资产里挑出 Windows 打包 zip：返回 (地址, 名字, 字节数)。
+
+    只认 .zip 且文件名含 win64，避免误取源码 zip（GitHub 自动附带的
+    Source code (zip) 也以 .zip 结尾，但名字里没有 win64）。
+    """
+    for item in assets or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        lower = name.lower()
+        if not lower.endswith(".zip") or "win64" not in lower:
+            continue
+        url = str(item.get("browser_download_url") or "")
+        if not url:
+            continue
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return url, name, size
+    return "", "", 0
 
 
 def fetch_latest_release() -> ReleaseInfo:
@@ -48,12 +78,16 @@ def fetch_latest_release() -> ReleaseInfo:
     tag = str(data.get("tag_name") or "").strip()
     if not tag:
         raise RuntimeError("最新版本信息缺少版本号")
+    asset_url, asset_name, asset_size = _pick_asset(data.get("assets"))
     return ReleaseInfo(
         tag=tag,
         url=str(data.get("html_url") or RELEASES_PAGE),
         name=str(data.get("name") or tag),
         body=str(data.get("body") or ""),
         published_at=str(data.get("published_at") or ""),
+        asset_url=asset_url,
+        asset_name=asset_name,
+        asset_size=asset_size,
     )
 
 
