@@ -184,7 +184,16 @@ class UpdateDialog(OverlayDialog):
 
     def _start_update(self) -> None:
         """主按钮：能就地更新就下载安装，否则退回打开下载页。"""
-        if not self._self_update or updater.install_dir() is None:
+        dest = updater.install_dir()
+        if not self._self_update or dest is None:
+            self._open_download()
+            return
+        # 装到 Program Files 又没提权时，替换脚本注定失败：别让用户先
+        # 下完 76 MB 再看到「更新未完成」，直接退回手动下载
+        if not updater.dir_writable(dest):
+            Toast.info(
+                self, "安装目录没有写权限，已改为打开下载页，请手动解压覆盖",
+                6000)
             self._open_download()
             return
         self._download_btn.setEnabled(False)

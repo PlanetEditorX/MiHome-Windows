@@ -76,6 +76,14 @@ def main() -> int:
             app.processEvents()
             time.sleep(0.02)
 
+    # 基线取决于跑测试时的真实会话状态：如果电脑正锁着（LogonUI 在跑），
+    # start() 取的基线就是 locked，紧接着的 LOCK 会被去重成"无变化"，
+    # 看起来像管道丢了第一个事件。先发一个 UNLOCK 把状态归一化。
+    if watcher.is_locked:
+        post(WTS_SESSION_UNLOCK)
+        assert watcher.is_locked is False, "基线归一化失败"
+        events.clear()
+
     # 真实场景顺序：锁屏 -> 解锁 -> 锁屏
     post(WTS_SESSION_LOCK)
     assert watcher.is_locked is True, "锁屏消息未驱动状态机"

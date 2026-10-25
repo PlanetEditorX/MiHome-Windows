@@ -140,7 +140,7 @@ print("7. 打包态主按钮 OK")
 # ---------- 8. 更新脚本模板 ----------
 script = updater._SCRIPT_TEMPLATE.format(
     src=r"D:\tmp\staging", dst=r"C:\app", exe=updater.EXE_NAME,
-    flag=updater.FAILURE_FLAG)
+    flag=updater.FAILURE_FLAG, log=updater.UPDATE_LOG)
 # cmd 代码页随系统而变，脚本必须能编成纯 ASCII，否则中文乱码会被当命令执行
 script.encode("ascii")
 for token in ("tasklist", "robocopy", "start \"\"", "rd /s /q", "del \"%~f0\""):
@@ -149,7 +149,140 @@ assert r'"%DST%\%EXE%"' in script, "启动路径拼接错误"
 # 覆盖失败要留标记，否则「更新失败」在用户眼里等于「更新成功」
 assert updater.FAILURE_FLAG in script, "缺少失败标记写入"
 assert updater.failure_flag_path().name == updater.FAILURE_FLAG
+
+# 关键：先把新版本整包复制到安装目录旁，再整目录 rename 交换。
+# 逐文件覆盖会在「有文件被占用」时留下新 dll + 旧 exe 的混搭，
+# 那个组合启动即崩、且版本号仍是旧的，用户要更新两三次才好。
+assert r'"%SRC%" "%NEW%"' in script, "必须先复制到 .new 再交换"
+assert r'"%SRC%" "%DST%"' not in script, "不允许再直接覆盖安装目录"
+assert r'move "%DST%" "%OLD%"' in script, "缺少安装目录改名"
+assert r'move "%NEW%" "%DST%"' in script, "缺少新版本顶上"
+assert r'move "%OLD%" "%DST%"' in script, "缺少失败回滚"
+# 交换后要确认新版没在启动瞬间死掉，否则用户面对的是「点了没反应」
+assert "rolling back" in script, "缺少启动存活检查"
+# 诊断日志：更新失败时唯一能拿到现场的东西
+assert r'>> "%LOG%"' in script, "缺少日志输出"
+assert updater.UPDATE_LOG in script
+# 启动时带上工作目录：cmd 的 CWD 是 %TEMP%，不指定会让程序以临时目录为起点
+assert r'start "" /D "%DST%"' in script, "启动未指定工作目录"
 print("8. 更新脚本模板 OK")
+
+# ---------- 8b. 真实跑一遍替换脚本：占用时不能混搭，正常时一次成功 ----------
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_probe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "where.exe"
+if _probe.exists():
+    _root = Path(_tempfile.mkdtemp(prefix="miupdate-"))
+    _dst = _root / "App"
+    _src = _root / "staged"
+    _exe = "probe.exe"
+    _flag = _root / "failed.txt"
+    _log = _root / "update.log"
+
+    def _fill(folder: Path, tag: str) -> None:
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True)
+        shutil.copy2(_probe, folder / _exe)
+        for i in range(4):
+            (folder / f"part{i}.dll").write_text(tag, encoding="utf-8")
+
+    def _run_script(skip_launch: bool = True) -> None:
+        _fill(_src, "new")
+        text = updater._SCRIPT_TEMPLATE.format(
+            src=str(_src), dst=str(_dst), exe=_exe,
+            flag=_flag.name, log=_log.name)
+        # 缩短重试：正常路径不该在测试里等两分钟
+        text = text.replace("lss 90", "lss 3")
+        text = text.replace('set "FLAG=%TEMP%\\', f'set "FLAG={_root}\\').replace(
+            'set "LOG=%TEMP%\\', f'set "LOG={_root}\\')
+        if skip_launch:
+            # 探针程序启动即退出，会误触发「启动即崩」回滚，跳过第 3 段
+            import re as _re
+            text = _re.sub(r"rem ---- 3\. start the new build.*?rem ---- 4\.",
+                           "rem ---- 4.", text, flags=_re.S)
+        _script = _root / "swap.cmd"
+        _script.write_text(text, encoding="ascii")
+        subprocess.run(["cmd.exe", "/c", str(_script)], capture_output=True,
+                       timeout=120)
+
+    def _part0() -> str:
+        p = _dst / "part0.dll"
+        return p.read_text(encoding="utf-8") if p.exists() else "<gone>"
+
+    # 8b-1 安装目录被占用：必须整体放弃，目录保持完整旧版（不能混搭）
+    _fill(_dst, "old")
+    _holder = open(_dst / _exe, "rb")
+    try:
+        _run_script()
+    finally:
+        _holder.close()
+    assert _part0() == "old", "占用时旧版必须原样保留，不能出现新 dll"
+    assert _flag.exists(), "放弃替换必须留失败标记"
+    assert _dst.is_dir(), "不能把安装目录弄丢"
+    print("8b-1. 目录被占用 → 保持完整旧版 + 失败标记 OK")
+
+    # 8b-2 无人占用：一次替换成功，且不留备份目录
+    _flag.unlink(missing_ok=True)
+    _run_script()
+    assert _part0() == "new", "空闲时应一次替换成功"
+    assert not _flag.exists(), "成功时不该留失败标记"
+    assert not (_root / "App.new").exists(), ".new 未清理"
+    assert not _src.exists(), "staging 未清理"
+    print("8b-2. 空闲时一次替换成功 OK")
+
+    # 8b-3 上次残留的 .new / .old：开跑前必须清掉，否则交换会撞名
+    _fill(_dst, "old")
+    shutil.rmtree(_root / "App.old", ignore_errors=True)
+    (_root / "App.new").mkdir()
+    (_root / "App.new" / "junk.txt").write_text("x", encoding="utf-8")
+    _flag.unlink(missing_ok=True)
+    _run_script()
+    assert _part0() == "new", "残留目录没清干净，交换失败"
+    assert not (_root / "App.new").exists(), "残留 .new 未清理"
+    print("8b-3. 残留 .new/.old 清理 OK")
+
+    # 8b-4 新版启动即退出：必须回滚到旧版并留标记（否则用户面对空窗）
+    _fill(_dst, "old")
+    _flag.unlink(missing_ok=True)
+    _run_script(skip_launch=False)
+    assert _part0() == "old", "新版启动失败时必须回滚"
+    assert _flag.exists(), "启动失败应留标记"
+    assert _dst.is_dir()
+    print("8b-4. 新版启动即崩 → 自动回滚旧版 OK")
+
+    shutil.rmtree(_root, ignore_errors=True)
+
+# 启动残留清理：staging 与 .old/.new 都不该永久堆积
+import time as _time  # noqa: E402
+
+_stage = Path(_tempfile.mkdtemp(prefix="mihome-update-"))
+(_stage / "leftover.bin").write_text("x", encoding="utf-8")
+# 5 分钟内的 staging 视为「可能正被本次更新使用」，清理函数会跳过它，
+# 这里把时间戳拨旧，模拟上一次更新遗留
+_old_ts = _time.time() - 3600
+os.utime(_stage, (_old_ts, _old_ts))
+_orig = updater.install_dir
+_fake_dst = Path(_tempfile.mkdtemp(prefix="miold-")) / "MiHome-Windows"
+_fake_dst.mkdir()
+(_fake_dst.with_name(_fake_dst.name + ".old")).mkdir()
+updater.install_dir = lambda: _fake_dst
+try:
+    updater.cleanup_leftovers()
+finally:
+    updater.install_dir = _orig
+assert not _stage.exists(), "staging 残留未清理"
+assert not _fake_dst.with_name(_fake_dst.name + ".old").exists(), ".old 未清理"
+print("8c. 启动残留清理 OK")
+
+# 写权限探测：可写目录返回 True，不存在/不可写的目录返回 False
+assert updater.dir_writable(_fake_dst) is True
+assert updater.dir_writable(_fake_dst / "nope" / "deeper") is False
+# 探测不该留下文件
+assert not list(_fake_dst.glob(".mihome-write-probe"))
+print("8d. 写权限探测 OK")
 
 # ---------- 9. 主界面手动入口 + 失败标记 ----------
 from app.ui.main_window import MainWindow

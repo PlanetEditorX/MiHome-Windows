@@ -684,7 +684,20 @@ class MainWindow(QMainWindow):
                 self._after_login_check(False),
             ),
         )
+        self._maybe_clean_update_leftovers()
         self._maybe_check_update()
+
+    def _maybe_clean_update_leftovers(self) -> None:
+        """后台清理上次更新残留（staging 与 .old/.new 备份）。
+
+        更新脚本收尾时删临时目录常被杀软挡下，而一次更新的解压产物有
+        上百 MB；每次启动顺手扫一遍，删失败也无所谓，别占着后台线程。
+        """
+        from app.core import updater
+
+        import threading
+
+        threading.Thread(target=updater.cleanup_leftovers, daemon=True).start()
 
     def _maybe_check_update(self) -> None:
         """按设置在启动时后台检查一次 GitHub 新版本。
