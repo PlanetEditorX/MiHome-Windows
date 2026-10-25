@@ -28,8 +28,14 @@ _CHUNK = 256 * 1024
 
 # 更新脚本模板。刻意保持纯 ASCII：cmd 的代码页随系统而变，中文注释
 # 在部分环境会乱码甚至被当成命令执行；路径由调用方以完整绝对路径填入。
+#
+# 所有系统工具都写 %SystemRoot%\System32 绝对路径：裸名会走 PATH，而
+# 用户装了 Git/MSYS、Cygwin 等工具链时 PATH 里常有同名 find.exe，会抢在
+# 系统的 find 之前被调用（实测 `find /I` 被 GNU find 当成路径而报错），
+# 让「等进程退出」的轮询静默失效、进而覆盖正在使用的 exe。
 _SCRIPT_TEMPLATE = """@echo off
 setlocal enabledelayedexpansion
+set "SYS=%SystemRoot%\\System32"
 set "SRC={src}"
 set "DST={dst}"
 set "EXE={exe}"
@@ -41,7 +47,7 @@ del "%FLAG%" 2>nul
 rem ---- 1. wait until this app has really exited (max 60s) ----
 set /a n=0
 :waitloop
-tasklist /FI "IMAGENAME eq %EXE%" 2>nul | find /I "%EXE%" >nul
+"%SYS%\\tasklist.exe" /FI "IMAGENAME eq %EXE%" 2>nul | "%SYS%\\findstr.exe" /I "%EXE%" >nul
 if not errorlevel 1 (
   set /a n+=1
   if !n! lss 60 (
@@ -53,7 +59,7 @@ if not errorlevel 1 (
 rem ---- 2. copy staged files over the install dir (robocopy 0-7 = ok) ----
 set /a tries=0
 :retry
-robocopy "%SRC%" "%DST%" /E /IS /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+"%SYS%\\robocopy.exe" "%SRC%" "%DST%" /E /IS /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 (
   set /a tries+=1
   if !tries! lss 20 (
@@ -69,7 +75,9 @@ rem ---- 3. start the new build, then clean up staging and self ----
 start "" "%DST%\\%EXE%"
 ping -n 3 127.0.0.1 >nul
 rd /s /q "%SRC%" 2>nul
-del "%~f0"
+rem (goto) makes cmd stop reading this file first, so deleting it here
+rem does not produce a trailing "batch file cannot be found" error
+(goto) 2>nul & del "%~f0"
 """
 
 # 更新失败标记：脚本覆盖失败时写到 %TEMP%，下次启动由界面提示并清除
@@ -125,6 +133,9 @@ class UpdateDownloader(QObject):
     def _fetch(self) -> Path:
         from app import __version__
 
+        # 解压直接落在 mkdtemp 根目录：交出去的路径本身就是「可以整个
+        # 删掉」的临时目录，替换脚本用一次 rd /s /q 就能清理干净，不必
+        # 去动它的父目录（父目录里可能有别的东西）
         staging = Path(tempfile.mkdtemp(prefix="mihome-update-"))
         archive = staging / "update.zip"
         try:
@@ -151,18 +162,16 @@ class UpdateDownloader(QObject):
                         done += len(chunk)
                         self.progress.emit(done, total)
 
-            unpacked = staging / "staging"
-            unpacked.mkdir()
             with zipfile.ZipFile(archive) as zf:
                 # 只接受普通文件/目录，挡住 zip 里的绝对路径与 .. 穿越
                 for member in zf.infolist():
-                    target = (unpacked / member.filename).resolve()
-                    if not str(target).startswith(str(unpacked.resolve())):
+                    target = (staging / member.filename).resolve()
+                    if not str(target).startswith(str(staging.resolve())):
                         raise RuntimeError("更新包包含非法路径")
-                zf.extractall(unpacked)
+                zf.extractall(staging)
             archive.unlink(missing_ok=True)
 
-            root = _app_root(unpacked)
+            root = _app_root(staging)
             if not (root / EXE_NAME).exists():
                 raise RuntimeError(f"更新包里没有 {EXE_NAME}")
             return root
