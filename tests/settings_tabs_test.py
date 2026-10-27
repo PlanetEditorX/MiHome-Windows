@@ -31,7 +31,8 @@ from app.ui.theme_service import apply_theme  # noqa: E402
 settings_store.set_autostart = lambda value: None
 apply_theme("dark")
 
-LOCK_ITEMS = ("_lock_item", "_lock_device_item", "_lock_unlock_item",
+LOCK_ITEMS = ("_lock_item", "_lock_device_item", "_lock_startup_item",
+              "_lock_unlock_item",
               "_lock_lock_item", "_lock_time_item", "_lock_span_item",
               "_lock_net_item", "_lock_netname_item")
 FEATURE_ITEMS = ("_autostart_item", "_speaker_item", "_tray_item",
@@ -58,7 +59,27 @@ def ancestor_chain(widget) -> list:
 parent = QWidget()
 parent.resize(1130, 752)
 
-dlg = SettingsDialog(parent, [])
+# 真实场景必须带设备：设备下拉按最长选项自适应到 300px 宽，会挤压
+# 左侧描述区；用空设备列表测出来的「一屏」是假象（下拉只有 150px）
+from app.core.models import DeviceInfo  # noqa: E402
+
+DEMO_DEVICES = [
+    DeviceInfo(f"d{i}", name, "model", "家", room, True)
+    for i, (name, room) in enumerate((
+        ("Yeelight 显示器挂灯", "书房"),
+        ("米家台灯 Pro", "卧室"),
+        ("客厅主灯", "客厅"),
+        ("空调伴侣", "卧室"),
+        ("扫地机器人", "客厅"),
+        ("空气净化器", "书房"),
+        ("智能插座", "厨房"),
+        ("温湿度计", "阳台"),
+        ("窗帘电机", "卧室"),
+        ("小爱音箱 Pro", "客厅"),
+    ))
+]
+
+dlg = SettingsDialog(parent, DEMO_DEVICES)
 dlg.show()
 for _ in range(5):
     app.processEvents()
@@ -70,7 +91,7 @@ assert [b.text() for b in dlg._tab_buttons] == list(_TAB_TITLES), \
 assert list(_TAB_TITLES) == ["主题界面", "应用功能", "锁屏联动"]
 print("1. 三个分类 tab OK")
 
-# ---------- 2. 卡片归属：锁屏 8 项在锁屏页，应用功能页不含 ----------
+# ---------- 2. 卡片归属：锁屏 9 项在锁屏页，应用功能页不含 ----------
 lock_page = dlg._lock_scroll
 features_page = dlg._features_scroll
 lock_cards = page_items(lock_page)
@@ -83,11 +104,11 @@ for name in FEATURE_ITEMS:
     card = getattr(dlg, name)
     assert card in feature_cards, f"{name} 不在应用功能页"
     assert card not in lock_cards, f"{name} 误入锁屏页"
-assert len(lock_cards) == 8, f"锁屏页卡片数 {len(lock_cards)}"
+assert len(lock_cards) == 9, f"锁屏页卡片数 {len(lock_cards)}"
 assert len(feature_cards) == 7, f"应用功能页卡片数 {len(feature_cards)}"
 # 控件本身必须真的挂在锁屏滚动区下（换页不会把它留在旧页里）
 assert lock_page in ancestor_chain(dlg._lock_time_start), "时间字段未挂在锁屏页"
-print("2. 卡片归属（锁屏 8 / 应用功能 7）OK")
+print("2. 卡片归属（锁屏 9 / 应用功能 7）OK")
 
 # ---------- 3. 切页可见性：只有当前页可见 ----------
 pages = (dlg._appearance_scroll, features_page, lock_page)
@@ -102,12 +123,17 @@ assert dlg._current_tab == _TAB_LOCK
 print("3. 切页可见性（一次只显示一页）OK")
 
 # ---------- 4. 三页都在一屏内（拆分的目的） ----------
-for name, scroll in (("主题界面", dlg._appearance_scroll),
-                     ("应用功能", features_page),
-                     ("锁屏联动", lock_page)):
-    hint = scroll.widget().sizeHint().height()
-    vp = scroll.viewport().height()
-    assert hint <= vp, f"{name} 页仍需滚动：内容 {hint} > 可视 {vp}"
+# 判据用滚动条的滚动范围而不是 sizeHint：QLabel 开了 wordWrap 后
+# sizeHint 会高估（实测 615 vs 真实 543），据此断言会逼着把 UI 压得过扁；
+# 滚动范围 >0 才是「真的需要滚」。
+for index, (name, scroll) in enumerate((("主题界面", dlg._appearance_scroll),
+                                        ("应用功能", features_page),
+                                        ("锁屏联动", lock_page))):
+    dlg._switch_tab(index)
+    for _ in range(4):
+        app.processEvents()
+    overflow = scroll.verticalScrollBar().maximum()
+    assert overflow == 0, f"{name} 页仍需滚动：溢出 {overflow}px"
 print("4. 三页内容均不超过一屏 OK")
 
 # ---------- 5. 跨页保存：改锁屏配置后仍写回 ----------

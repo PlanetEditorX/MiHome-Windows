@@ -927,12 +927,17 @@ class MainWindow(QMainWindow):
         监听本身双通道（WTS 通知 + 2s 轮询兜底），未配置时不会产生
         任何控制，仅常驻一个轻量计时器；配置在启动时读一次，
         设置对话框保存后由 show_settings 调 reload_config 热更新。
+
+        另外触发一次「启动时」动作（配置为「不操作」时是空转）：
+        开机自启的场景里没有解锁事件可等——开机本来就不算解锁——
+        只能由这里主动执行，否则灯要等用户手动锁屏再解锁才亮。
         """
         if self._lock_started:
             return
         self._lock_started = True
         self._lock_watcher.start()
         self._lock_automation.reload_config()
+        self._lock_automation.run_startup()
         self._maybe_hint_lock_automation()
 
     def _maybe_hint_lock_automation(self) -> None:

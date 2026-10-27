@@ -200,6 +200,9 @@ _LOCK_ACTIONS = ("on", "off", "none")
 _LOCK_DEFAULTS = {
     "enabled": False,
     "did": "",
+    # 应用启动（登录完成）时执行的动作。默认「不操作」：这是 v0.8.4 新增
+    # 的方向，老配置升级后不该凭空多出一个开机动作，由用户显式开启。
+    "startup_action": "none",
     "unlock_action": "on",
     "lock_action": "off",
     "time_enabled": False,
@@ -244,9 +247,13 @@ def _normalize_lock_automation(raw) -> dict:
         did = ""
     unlock = raw.get("unlock_action")
     lock = raw.get("lock_action")
+    startup = raw.get("startup_action")
     return {
         "enabled": bool(raw.get("enabled", _LOCK_DEFAULTS["enabled"])),
         "did": did,
+        # 旧配置没有 startup_action 键：回落默认（不操作），不影响老用户
+        "startup_action": (startup if startup in _LOCK_ACTIONS
+                           else _LOCK_DEFAULTS["startup_action"]),
         "unlock_action": unlock if unlock in _LOCK_ACTIONS else _LOCK_DEFAULTS["unlock_action"],
         "lock_action": lock if lock in _LOCK_ACTIONS else _LOCK_DEFAULTS["lock_action"],
         "time_enabled": bool(raw.get("time_enabled", _LOCK_DEFAULTS["time_enabled"])),

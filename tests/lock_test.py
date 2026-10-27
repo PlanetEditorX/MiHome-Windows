@@ -10,7 +10,11 @@
    在途去重、失败发 failed 且 pending 清理（后续事件仍可执行）
 3.5+ 生效时间/网络条件门：未命中不控制但发 skipped 带原因；
    网络命中（大小写不敏感包含）才执行；查询失败保守跳过
-4. 主窗口接线：组件存在、成功回写开关记忆、start 后轮询兜底在跑
+3.6+ 启动方向：应用启动时主动执行一次（开机没有解锁事件可等）、
+   「不操作」空转、服务未就绪不报错而是重试、重试成功即控制、
+   配置中途改动放弃、预算耗尽发 skipped
+4. 主窗口接线：组件存在、成功回写开关记忆、启动时触发一次动作、
+   start 后轮询兜底在跑
 """
 
 import os
@@ -34,6 +38,7 @@ from app.core import settings_store
 cfg = settings_store.get_lock_automation()
 assert cfg == {
     "enabled": False, "did": "",
+    "startup_action": "none",
     "unlock_action": "on", "lock_action": "off",
     "time_enabled": False, "time_start": "08:00", "time_end": "23:00",
     "net_enabled": False, "net_names": [],
@@ -43,10 +48,20 @@ settings_store.set_lock_automation(
     {"enabled": True, "did": "lamp1", "unlock_action": "off", "lock_action": "on"})
 assert settings_store.get_lock_automation() == {
     "enabled": True, "did": "lamp1",
+    "startup_action": "none",
     "unlock_action": "off", "lock_action": "on",
     "time_enabled": False, "time_start": "08:00", "time_end": "23:00",
     "net_enabled": False, "net_names": [],
 }, "存取往返不一致"
+
+# 旧配置（无 startup_action 键）升级后不得凭空多出启动动作
+settings_store.set_lock_automation({"enabled": True, "did": "lamp1"})
+assert settings_store.get_lock_automation()["startup_action"] == "none", \
+    "旧配置未回落「不操作」"
+settings_store.set_lock_automation(
+    {"enabled": True, "did": "lamp1", "startup_action": "on"})
+assert settings_store.get_lock_automation()["startup_action"] == "on", \
+    "启动动作未存取"
 
 # 非法值一律收敛：did 非字符串按未选择，动作越界回落默认
 settings_store.set_lock_automation(
@@ -359,6 +374,97 @@ try:
 finally:
     _la.current_network_names = _real_net
 print("3.5+ 生效时间/网络条件门 OK")
+
+# ---------- 3.6+ 启动方向（应用启动时执行一次 + 未就绪重试） ----------
+# 开机自启时既等不到解锁事件（开机本来就不算解锁），网络与令牌也常未就绪。
+# 所以启动方向是「主动触发 + 落空重试」，与两条被动事件路径语义不同。
+
+from PySide6.QtCore import QEventLoop, QTimer as _QTimer
+
+
+def _pump(ms: int = 120) -> None:
+    """转一圈事件循环：让 QTimer.singleShot 排的重试真正跑起来。"""
+    loop = QEventLoop()
+    _QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+
+_real_retry_ms = _la._STARTUP_RETRY_MS
+try:
+    _la._STARTUP_RETRY_MS = 0   # 测试里不真等 20 秒
+
+    # 3.10 启动=打开：主动触发一次开灯（用户要的核心语义）
+    settings_store.set_lock_automation({
+        "enabled": True, "did": "lamp1", "startup_action": "on",
+        "unlock_action": "on", "lock_action": "off",
+    })
+    auto.reload_config()
+    jobs.tasks.clear()
+    applied.clear()
+    calls_before = len(service.calls)
+    auto.run_startup()
+    assert len(jobs.tasks) == 1, "启动动作未提交任务"
+    _drain(jobs, service)
+    assert len(service.calls) == calls_before + 1 and \
+        service.calls[-1] == ("lamp1", True), f"启动未开灯: {service.calls}"
+    assert applied[-1] == ("lamp1", True), "启动成功未回传状态"
+
+    # 3.11 启动=不操作（默认值）：不提交任何任务
+    settings_store.set_lock_automation({
+        "enabled": True, "did": "lamp1", "startup_action": "none"})
+    auto.reload_config()
+    jobs.tasks.clear()
+    auto.run_startup()
+    assert jobs.tasks == [], "「不操作」仍提交了任务"
+
+    # 3.12 总开关关闭：启动方向同样不该动
+    settings_store.set_lock_automation({
+        "enabled": False, "did": "lamp1", "startup_action": "on"})
+    auto.reload_config()
+    jobs.tasks.clear()
+    auto.run_startup()
+    assert jobs.tasks == [], "总开关关闭仍提交了任务"
+
+    # 3.13 服务未就绪（未登录）：不算失败、不弹提示，排重试；
+    # 就绪后重试那一枪必须真的把灯打开——否则「开机开灯」形同虚设
+    settings_store.set_lock_automation({
+        "enabled": True, "did": "lamp1", "startup_action": "on",
+        "unlock_action": "none", "lock_action": "none"})
+    auto.reload_config()
+    jobs.tasks.clear()
+    applied.clear()
+    failures.clear()
+    service._logged_in = False
+    auto.run_startup()
+    assert len(jobs.tasks) == 1, "未就绪守卫应仍在任务内执行"
+    _drain(jobs, service)
+    assert applied == [] and failures == [], "未就绪被当成成功/失败上报"
+    assert auto._startup_tries == 1, \
+        f"未就绪未排重试: tries={auto._startup_tries}"
+    _pump()   # 0ms 重试定时器到点 → 再次提交
+    assert len(jobs.tasks) == 1, "重试未重新提交任务"
+    service._logged_in = True
+    _drain(jobs, service)
+    assert service.calls[-1] == ("lamp1", True), f"重试后仍未开灯: {service.calls}"
+    assert applied[-1] == ("lamp1", True), "重试成功未回传状态"
+
+    # 3.14 重试途中配置被改成「不操作」：放弃，不补偿动作
+    settings_store.set_lock_automation({
+        "enabled": True, "did": "lamp1", "startup_action": "none"})
+    auto.reload_config()
+    jobs.tasks.clear()
+    auto._retry_startup()
+    assert jobs.tasks == [], "配置已改为不操作，重试仍提交了任务"
+
+    # 3.15 重试预算耗尽：发一次 skipped 说明，不静默吞掉
+    skipped.clear()
+    auto._startup_tries = _la._STARTUP_MAX_TRIES
+    auto._schedule_startup_retry()
+    assert skipped and "未生效" in skipped[0], f"预算耗尽未提示: {skipped}"
+finally:
+    _la._STARTUP_RETRY_MS = _real_retry_ms
+    service._logged_in = True
+print("3.6+ 启动方向（主动触发/不操作/未就绪重试/预算耗尽） OK")
 
 # ---------- 4. 主窗口接线 ----------
 

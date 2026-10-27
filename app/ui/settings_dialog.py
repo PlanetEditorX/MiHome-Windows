@@ -128,7 +128,7 @@ class SettingsDialog(OverlayDialog):
         # 分类展示后单项行更少，面板放大到主窗口约八成，减少滚动
         if parent is not None:
             pw = max(720, int(parent.width() * 0.78))
-            ph = max(520, int(parent.height() * 0.85))
+            ph = max(520, int(parent.height() * 0.92))
         else:
             pw, ph = 720, 520
         panel.setFixedSize(pw, ph)
@@ -205,7 +205,9 @@ class SettingsDialog(OverlayDialog):
         """设置项卡片外壳：返回 (卡片, 标题, 描述, 行布局)，控件由调用方塞入行。"""
         item = QFrame()
         row = QHBoxLayout(item)
-        row.setContentsMargins(14, 12, 14, 12)
+        # 上下 10：锁屏联动页 9 项时，每项省 4px 恰好能把整页压进一屏
+        # （真实设备下设备下拉宽 300px 会挤压描述区，比空设备列表更占高）
+        row.setContentsMargins(14, 10, 14, 10)
         row.setSpacing(12)
         texts = QVBoxLayout()
         texts.setContentsMargins(0, 0, 0, 0)
@@ -508,6 +510,17 @@ class SettingsDialog(OverlayDialog):
         self._lock_device_combo.setFixedWidth(min(max(text_w + 48, 150), 300))
         lock_device_row.addWidget(self._lock_device_combo)
 
+        # 启动时动作（子设置）
+        self._lock_startup_item, self._lock_startup_label, \
+            self._lock_startup_desc, lock_startup_row = self._make_item(
+                "启动时", "应用启动（随系统自启动）后对「联动设备」执行的操作；"
+                "开机不算解锁，靠这一项点亮")
+        self._lock_startup_combo = themed_combo(
+            [_LOCK_ACTION_LABELS[a] for a in ("on", "off", "none")],
+            current=_LOCK_ACTION_LABELS.get(
+                self._lock_cfg["startup_action"], "不操作"))
+        lock_startup_row.addWidget(self._lock_startup_combo)
+
         # 解锁时动作（子设置）
         self._lock_unlock_item, self._lock_unlock_label, self._lock_unlock_desc, \
             lock_unlock_row = self._make_item(
@@ -592,10 +605,11 @@ class SettingsDialog(OverlayDialog):
 
         return self._build_scroll([
             self._lock_item, self._lock_device_item,
+            self._lock_startup_item,
             self._lock_unlock_item, self._lock_lock_item,
             self._lock_time_item, self._lock_span_item,
             self._lock_net_item, self._lock_netname_item,
-        ], spacing=6)
+        ], spacing=5)
 
     # ---------- 分类切换 ----------
 
@@ -656,6 +670,7 @@ class SettingsDialog(OverlayDialog):
                      self._update_item, self._board_item, self._accent_item,
                      self._offline_item,
                      self._lock_item, self._lock_device_item,
+                     self._lock_startup_item,
                      self._lock_unlock_item, self._lock_lock_item,
                      self._lock_time_item, self._lock_span_item,
                      self._lock_net_item, self._lock_netname_item):
@@ -899,6 +914,8 @@ class SettingsDialog(OverlayDialog):
                 self._lock_unlock_combo.currentText(), "on"),
             "lock_action": _LOCK_LABEL_TO_ACTION.get(
                 self._lock_lock_combo.currentText(), "off"),
+            "startup_action": _LOCK_LABEL_TO_ACTION.get(
+                self._lock_startup_combo.currentText(), "none"),
             "time_enabled": self._lock_time_toggle.isChecked(),
             "time_start": self._lock_time_start.time().toString("HH:mm"),
             "time_end": self._lock_time_end.time().toString("HH:mm"),
@@ -999,6 +1016,8 @@ class SettingsDialog(OverlayDialog):
         desc_color = SiColors.TEXT_SECONDARY if enabled else SiColors.TEXT_FAINT
         for label, desc, control in (
             (self._lock_device_label, self._lock_device_desc, self._lock_device_combo),
+            (self._lock_startup_label, self._lock_startup_desc,
+             self._lock_startup_combo),
             (self._lock_unlock_label, self._lock_unlock_desc, self._lock_unlock_combo),
             (self._lock_lock_label, self._lock_lock_desc, self._lock_lock_combo),
             (self._lock_span_label, self._lock_span_desc, self._lock_time_start),
