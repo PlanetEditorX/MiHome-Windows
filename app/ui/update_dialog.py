@@ -243,8 +243,11 @@ class UpdateDialog(OverlayDialog):
         try:
             old = updater.apply_update(staging, dest)
         except Exception as exc:
-            _logger.warning("update: apply failed: %s", exc)
-            self._restore_after_failure(f"安装失败：{exc}（更新包已保存，重试无需重新下载）")
+            # 完整的 WinError 只写日志；Toast 放不下长文本，之前就是被截断的
+            _logger.warning("update: apply failed: %s", exc, exc_info=True)
+            self._download_btn.setToolTip(
+                "更新包已保存在本地，再点一次会直接安装，不会重新下载")
+            self._restore_after_failure(f"安装失败：{exc}")
             return
         # 启动新版并观察几秒：启动即崩会被自动还原，这里就能告诉用户，
         # 而不是等他下次双击 exe 才发现程序打不开

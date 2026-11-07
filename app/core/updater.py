@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # MiHome-Windows: 米家设备的 Windows 桌面控制端
 # Copyright (C) 2026 MiHome-Windows contributors
-"""应用内更新：下载（可续传）→ 落盘缓存 → 解压暂存 → 进程内整目录交换 → 重启。
+"""应用内更新：下载（可续传）→ 落盘缓存 → 解压暂存 → 进程内替换目录内容 → 重启。
 
 v0.8.3~v0.9.0 用的是「写一个 cmd 脚本、退出进程、由脚本 robocopy + move +
 start」的做法。实测在目标机器上这条链路会在中途静默中断：脚本写了第一行
@@ -9,17 +9,27 @@ start」的做法。实测在目标机器上这条链路会在中途静默中断
 还是旧版本 → 再点更新又从零下载」。脚本本身不可观测、不可调试，也不受
 应用控制（被杀软拦、被 HIPS 终止都表现为「什么都没发生」）。
 
-因此这里把替换动作整个搬回进程内：
+因此这里把替换动作整个搬回进程内。v0.9.1/0.9.2 用的是「整目录改名」
+（`<安装目录>` → `.old`，`.new` → `<安装目录>`），但真机上会稳定失败：
 
-1. Windows 允许改名一个**正在运行**的目录及其中的 exe（只是不允许删除），
-   所以完全可以在应用还活着的时候把 `<安装目录>` 改名为 `<安装目录>.old`，
-   再把已经解压好的 `<安装目录>.new` 顶上去。整目录改名是原子的，不存在
-   「新 dll + 旧 exe」的混搭中间态。
-2. 替换完立刻启动新版本并观察 6 秒：活着才算成功；启动即崩就把旧目录换回来，
-   应用继续照常运行（不会出现「点完更新，程序没了」）。
-3. 所有失败都在对话框里当场说明，不再依赖「下次启动看标记文件」。
+    [WinError 32] 另一个程序正在使用此文件: '<安装目录>' -> '<安装目录>.old'
 
-另外两点是这一版新增的：
+实测同一台机器、同一个正在运行的应用：**目录里的文件和子目录都能改名，
+唯独安装目录本身不能**——应用（或资源管理器/杀软）持有该目录的句柄。
+注意这与「notepad 单文件」的探测结论不同，别再拿那个结论当依据。
+
+现在改成**只搬目录里的顶层条目，永远不改名安装目录本体**：
+
+1. 旧内容逐条改名到 `<安装目录>.old/`（每条独立重试；失败即整批还原）
+2. 新内容逐条从 `<安装目录>.new/` 改名进安装目录（失败同样整批还原）
+3. 替换完立刻启动新版本并观察 6 秒：活着才算成功；启动即崩把旧内容搬回来，
+   应用继续照常运行（不会出现「点完更新，程序没了」）
+4. 所有失败都在对话框里当场说明，不再依赖「下次启动看标记文件」
+
+每一步都是同盘 rename（元数据操作，47 个条目毫秒级完成），且旧内容在
+`.old` 里完整保留，任何一步失败都能还原现场，不会留下「新 dll + 旧 exe」。
+
+另外两点：
 - **下载包落盘缓存**：按版本号存在数据目录的 `update/` 下，一次下不完支持
   断点续传（HTTP Range）。第二次点更新先用上次的包，包不完整才续传，
   续传失败才从头下载——不再每次都从 0 MB 开始。
@@ -403,22 +413,52 @@ def _rename_retry(src: Path, dst: Path, timeout: float = _RENAME_SECONDS) -> Non
             time.sleep(0.1)
 
 
+def _entries(path: Path) -> list[Path]:
+    """目录里的顶层条目，按名字排序（两个阶段/回滚的顺序要能对上）。"""
+    return sorted(path.iterdir(), key=lambda p: p.name)
+
+
+def _move_entries(src: Path, dst_dir: Path, moved: list[str]) -> None:
+    """把 src 下的顶层条目逐条改名到 dst_dir，成功后记下名字供回滚。
+
+    这里刻意**不改名 src 目录本身**：应用自己（或资源管理器、杀软）往往
+    持有安装目录的句柄，整目录改名会稳定报 WinError 32；里面的条目改名
+    则不受影响（真机实测：文件 OK、子目录 OK、目录本体 FAIL）。
+    """
+    for item in _entries(src):
+        _rename_retry(item, dst_dir / item.name)
+        moved.append(item.name)
+
+
+def _restore_entries(src_dir: Path, dst: Path, moved: list[str]) -> None:
+    """尽力把 _move_entries 搬走的东西搬回去（失败只记日志，继续还原其余）。"""
+    for name in reversed(moved):
+        src, target = src_dir / name, dst / name
+        if not src.exists():
+            continue
+        try:
+            _rename_retry(src, target, timeout=1.0)
+        except OSError:
+            _logger.exception("update: cannot restore %s", target)
+
+
 def _fresh_old_dir(dest: Path) -> Path:
-    """给旧版本找一个可用的备份目录名（优先 `<安装目录>.old`）。"""
+    """建一个空的备份目录（优先 `<安装目录>.old`），返回它的路径。"""
     preferred = dest.with_name(dest.name + ".old")
     if preferred.exists():
         _rmtree(preferred)
-    if not preferred.exists():
-        return preferred
-    return dest.with_name(f"{dest.name}.old-{int(time.time())}")
+    if preferred.exists():
+        # 上一轮的旧 exe 还被占用，删不干净：换个名字，绝不往里混内容
+        preferred = dest.with_name(f"{dest.name}.old-{int(time.time())}")
+    preferred.mkdir(parents=True, exist_ok=True)
+    return preferred
 
 
 def apply_update(staged: Path, dest: Path) -> Path:
-    """把暂存的新版本换成安装目录，返回旧版本所在目录。
+    """把暂存的新版本换进安装目录，返回旧版本所在的备份目录。
 
-    整个过程在应用还活着的时候完成：整目录改名不要求里面的文件先关闭
-    （Windows 只禁止删除运行中的 exe，不禁止改名）。任一步失败都回滚，
-    绝不留下半新半旧的目录——那种目录启动即崩，正是「要装两三次」的根因。
+    只搬目录内容、不改名安装目录本体；任何一步失败都整批还原，绝不留下
+    「新 dll + 旧 exe」的混搭目录——那正是「要装两三次」的根因。
     """
     if not (staged / EXE_NAME).exists():
         raise RuntimeError(f"暂存目录里没有 {EXE_NAME}")
@@ -428,45 +468,71 @@ def apply_update(staged: Path, dest: Path) -> Path:
         raise RuntimeError("安装目录所在文件夹不可写，无法完成替换")
 
     old = _fresh_old_dir(dest)
-    _logger.info("update: swap %s -> %s", dest, old)
-    try:
-        _rename_retry(dest, old)
-    except OSError as exc:
-        raise RuntimeError(f"安装目录被占用，无法替换（{exc}）") from exc
+    _logger.info("update: swap contents of %s -> %s", dest, old)
+    moved_out: list[str] = []
+    moved_in: list[str] = []
 
+    # 阶段一：旧内容整体让位。此时安装目录短暂为空，但目录本体一直在，
+    # 应用持有的句柄、快捷方式、当前工作目录都不受影响。
     try:
-        _rename_retry(staged, dest)
+        _move_entries(dest, old, moved_out)
     except OSError as exc:
-        try:
-            os.rename(old, dest)
-        except OSError:
-            _logger.exception("update: rollback failed after swap error")
-        raise RuntimeError(f"新版本就位失败（{exc}），已还原旧版本") from exc
+        _logger.warning("update: cannot move old files aside: %s", exc)
+        _restore_entries(old, dest, moved_out)
+        _rmtree(old)
+        # 文案保持短：Toast 显示不下完整 WinError，技术细节只进日志
+        raise RuntimeError(
+            "安装目录有文件被占用；请关闭该文件夹的窗口后重试") from exc
+
+    # 阶段二：新内容就位。失败时先把新文件退回 .new，再把旧文件放回安装目录。
+    try:
+        _move_entries(staged, dest, moved_in)
+    except OSError as exc:
+        _logger.warning("update: cannot move new files in: %s", exc)
+        _restore_entries(dest, staged, moved_in)
+        _restore_entries(old, dest, moved_out)
+        _rmtree(old)
+        raise RuntimeError("新版本就位失败，已还原旧版本，可再试一次") from exc
 
     (dest / _STAGED_MARK).unlink(missing_ok=True)
+    _rmtree(staged)       # 已经搬空，去掉空壳，下次重新解压即可
     _logger.info("update: swapped, new build at %s", dest)
     return old
 
 
 def _rollback(dest: Path, old: Path) -> None:
-    """新版启动即崩：把坏目录挪开、旧目录还原回安装位置。"""
+    """新版启动即崩：把坏内容挪到 .bad，再把 .old 里的旧内容搬回安装目录。
+
+    同样只操作目录内容。整目录改名在这里一样会撞 WinError 32，不能用。
+    """
     bad = dest.with_name(dest.name + ".bad")
     _rmtree(bad)
     try:
-        os.rename(dest, bad)
+        bad.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        _logger.exception("update: cannot create .bad dir")
+        return
+
+    moved: list[str] = []
+    try:
+        _move_entries(dest, bad, moved)
     except OSError:
         _logger.exception("update: cannot move broken build aside")
+        _restore_entries(bad, dest, moved)
         return
+
+    restored: list[str] = []
     try:
-        os.rename(old, dest)
+        _move_entries(old, dest, restored)
     except OSError:
-        _logger.exception("update: rollback rename failed")
-        try:
-            os.rename(bad, dest)
-        except OSError:
-            _logger.exception("update: cannot restore new build either")
+        _logger.exception("update: rollback move failed")
+        # 先把已经搬回来的退回 old，再把坏版本放回 dest，尽量保持可用
+        _restore_entries(dest, old, restored)
+        _restore_entries(bad, dest, moved)
         return
+
     _rmtree(bad)
+    _rmtree(old)
     try:
         failure_flag_path().write_text("startup failed", encoding="utf-8")
     except OSError:

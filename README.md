@@ -190,6 +190,7 @@ app/
 │   ├── lock_automation.py      # 锁屏联动：锁屏/解锁事件 → 一组设备/自动化控制
 │   ├── lock_conditions.py      # 联动生效条件：每日时段窗（可跨午夜）+ 生效网络匹配
 │   ├── update_checker.py       # GitHub Releases 新版本检查（后台线程 + 信号）
+│   ├── updater.py              # 应用内更新：缓存续传 → 解压暂存 → 只搬目录内容替换 → 重启验活
 │   ├── name_override_store.py  # 自定义设备名称持久化
 │   ├── name_store.py           # 产品页中文商品名缓存
 │   ├── spec_zh.py              # 属性/动作名中文兜底表
@@ -253,7 +254,7 @@ tests/
 ├── schedule_test.py            # 定时开关回归（到点/错过/停用/界面接线）
 ├── lock_test.py                # 锁屏联动回归（配置迁移/多目标执行/状态机去重/执行守卫/界面接线）
 ├── audio_test.py               # 托盘音响栏回归（音箱下拉/独立偏好/音量渲染）
-├── update_test.py              # 版本检查与提示对话框回归（版本比较/日志渲染）
+├── update_test.py              # 应用内更新回归（缓存续传/目录占用下替换/失败还原/上游基线）
 ├── dispatch_test.py            # 任务队列优先级与投递顺序回归
 └── subdevice_test.py           # 多键面板虚拟子设备的通道映射回归
 

@@ -175,6 +175,7 @@ def _make_zip(path: Path, tag: str, extra: str = "new") -> bytes:
 
 
 _orig_install = updater.install_dir
+_real_rename = os.rename
 updater.install_dir = lambda: _dest
 try:
     # ---------- 8a. 缓存命中：一条请求都不该发 ----------
@@ -307,6 +308,21 @@ try:
     assert not _arc4.exists(), "校验失败的包必须删掉，否则每次重试都白解压"
     print("8e. 校验失败 → 删包报错 OK")
 
+    # ---------- 8f0. 真机回归：安装目录本体被占用（WinError 32） ----------
+    # v0.9.1/0.9.2 在这里稳定失败：应用/资源管理器持有安装目录句柄，
+    # 整目录改名必报 32，但目录内的文件与子目录改名完全正常（实机实测）。
+    # 从这里起全程注入这个限制，下面的安装、回滚、清理都必须不再碰目录本体。
+    _blocked = {"dir": 0}
+
+    def _locked_dir_rename(src, dst):
+        if Path(src) == _dest or Path(dst) == _dest:
+            _blocked["dir"] += 1
+            raise PermissionError(
+                32, "另一个程序正在使用此文件，进程无法访问", str(src), 32)
+        return _real_rename(src, dst)
+
+    os.rename = _locked_dir_rename
+
     # ---------- 8f. 进程内整目录交换 ----------
     _old = updater.apply_update(_staged, _dest)
     assert (_dest / updater.EXE_NAME).read_bytes().startswith(b"MZ" + b"v9.9.9")
@@ -316,8 +332,8 @@ try:
     assert (_old / updater.EXE_NAME).exists() is False
     # 暂存标记属于缓存元数据，装完后不该留在安装目录里
     assert not (_dest / updater._STAGED_MARK).exists()
-    # 运行中的安装目录可以改名（Windows 只禁止删除），交换才可能不退出进程
-    print("8f. 整目录交换 OK")
+    assert _blocked["dir"] == 0, "又去改安装目录本体了，真机必报 WinError 32"
+    print("8f. 目录本体被锁时仍能只搬内容完成替换 OK")
 
     # ---------- 8g. 新版启动即崩 → 回滚 ----------
     updater._rollback(_dest, _old)
@@ -327,6 +343,7 @@ try:
     assert not _dest.with_name(_dest.name + ".bad").exists(), "回滚后应清掉坏目录"
     assert updater.failure_flag_path().exists(), "回滚要留标记"
     updater.failure_flag_path().unlink(missing_ok=True)
+    assert _blocked["dir"] == 0, "回滚也不能改安装目录本体"
     print("8g. 启动失败回滚 OK")
 
     # ---------- 8h. 交换失败要回滚，不能把安装目录弄丢 ----------
@@ -342,6 +359,37 @@ try:
     assert _raised, "暂存目录不完整时必须拒绝安装"
     assert (_dest / "old.dll").exists(), "拒绝安装时安装目录必须原样保留"
     print("8h. 暂存不完整 → 拒绝安装且不动现场 OK")
+
+    # ---------- 8h2. 搬入到一半失败：整批还原，.new 留着可重试 ----------
+    _staged3 = updater.staged_dir(_dest)
+    shutil.rmtree(_staged3, ignore_errors=True)
+    _staged3.mkdir(parents=True)
+    (_staged3 / updater.EXE_NAME).write_bytes(b"MZnew")
+    (_staged3 / "a.dll").write_text("A", encoding="utf-8")
+    (_staged3 / "b.dll").write_text("B", encoding="utf-8")
+
+    def _fail_second(src, dst):
+        if Path(src).name == "b.dll" and Path(dst).parent == _dest:
+            raise PermissionError(32, "共享冲突", str(src), 32)
+        return _locked_dir_rename(src, dst)
+
+    os.rename = _fail_second
+    _raised = False
+    try:
+        updater.apply_update(_staged3, _dest)
+    except RuntimeError as exc:
+        _raised = "已还原旧版本" in str(exc)
+    finally:
+        os.rename = _locked_dir_rename
+    assert _raised, "搬入失败时应报错并说明已还原"
+    assert (_dest / "old.dll").read_text(encoding="utf-8") == "old", \
+        "失败后安装目录必须是完整的旧版本"
+    assert not (_dest / "a.dll").exists() and not (_dest / "b.dll").exists(), \
+        "失败后不能留下半新半旧的目录"
+    assert not _dest.with_name(_dest.name + ".old").exists(), "备份目录应清理"
+    assert (_staged3 / updater.EXE_NAME).exists() and \
+        (_staged3 / "b.dll").exists(), "新内容应退回 .new，供下次直接重试"
+    print("8h2. 搬入中途失败 → 现场完整还原 OK")
 
     # ---------- 8i. 启动残留清理 ----------
     _stale = Path(_tempfile.mkdtemp(prefix="mihome-update-"))
@@ -374,6 +422,7 @@ try:
     assert _keep.parent.exists(), "最新版本的缓存不该被清掉"
     print("8j. 缓存裁剪 OK")
 finally:
+    os.rename = _real_rename
     updater.install_dir = _orig_install
     shutil.rmtree(_root, ignore_errors=True)
     for _p in (_root,):
