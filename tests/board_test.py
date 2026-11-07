@@ -393,6 +393,9 @@ app.processEvents()
 # 顶栏状态胶囊：亮灯数/温湿度/耗材按当前范围刷新
 win._known_power = {devs[0].did: True, devs[1].did: False}
 win._metrics = {devs[0].did: "22.1°C 69%"}
+# 温湿度胶囊读原始读数：副标题文案可能被用户改成别的属性，
+# 不能从文案里解析，所以这里单独喂一份 _climate
+win._climate = {devs[0].did: {"temperature": 22.1, "relative-humidity": 69.0}}
 win._consumables = [{"did": devs[0].did, "name": "牙刷", "description": "电池",
                      "value": 22, "threshold": 25, "low": True, "updated": 0}]
 win._update_count_label()
@@ -646,10 +649,10 @@ dlg2._bg_chips[0].click()
 assert board_store.get_bg() is None
 assert bg_events[-1] is None, "恢复跟随主题应发出 None"
 # 两个勾选框用自绘样式：选中时画主题色方块 + 对勾，不只是填色
-from app.ui.board_manager import _CheckBox
+from app.ui.check_box import SiCheckBox
 
-assert isinstance(dlg2._topmost_check, _CheckBox), "置顶勾选框未用自绘样式"
-assert isinstance(dlg2._lock_check, _CheckBox), "锁定勾选框未用自绘样式"
+assert isinstance(dlg2._topmost_check, SiCheckBox), "置顶勾选框未用自绘样式"
+assert isinstance(dlg2._lock_check, SiCheckBox), "锁定勾选框未用自绘样式"
 assert dlg2._topmost_check.sizeHint().width() > 20, "勾选框宽度异常"
 # 置顶勾选框
 dlg2._topmost_check.setChecked(True)

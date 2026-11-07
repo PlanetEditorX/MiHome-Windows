@@ -130,7 +130,16 @@ class OverlayDialog(QDialog):
             anim.setDuration(100)
             anim.setStartValue(self.windowOpacity())
             anim.setEndValue(0.0)
-            anim.finished.connect(lambda: QDialog.done(self, result))
+
+            def _finish() -> None:
+                # 淡出这 100ms 里父窗口可能被关闭，连带销毁本对话框；
+                # 直接调 QDialog.done 会访问已释放的 C++ 对象导致崩溃
+                import shiboken6
+
+                if shiboken6.isValid(self):
+                    QDialog.done(self, result)
+
+            anim.finished.connect(_finish)
             anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
             self._fade_out_anim = anim
             return

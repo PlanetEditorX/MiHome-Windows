@@ -9,6 +9,8 @@
 本测试锁死：did 后缀 N 必须映射到 siid N，读写都按这一路发请求。
 """
 
+import threading
+
 from app.core.service import MijiaService
 
 # 与真实 linp.switch.e3sbw3 规格一致的三路 on 属性
@@ -86,6 +88,8 @@ class FakeApi:
 def make_service(spec):
     """绕过登录构造 service：只装本次要用的最小状态。"""
     svc = object.__new__(MijiaService)
+    # 上游方法现在裹了 _serialized（实例锁串行化），手工构造的实例也得有锁
+    svc._lock = threading.RLock()
     svc._device_index = {}
     svc._spec_cache = {}
     svc._api = FakeApi()

@@ -57,6 +57,8 @@ workbench.json
 settings.json
 board.json
 schedules.json
+device_names.json
+product_names.json
 # 原子写的临时残留（正常流程会被 os.replace 消费）
 *.json.tmp
 

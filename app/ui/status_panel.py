@@ -308,10 +308,11 @@ class StatusPanelDialog(OverlayDialog):
         QTimer.singleShot(0, self._fill_and_place)
 
     def _fill_and_place(self) -> None:
-        # 延迟回调可能在面板已经关闭后才到，先确认底层对象还活着
+        # 延迟回调可能在面板已经关闭后才到，先确认底层对象还活着；
+        # 已经在关闭流程里也不要再淡入，否则会和淡出抢透明度
         import shiboken6
 
-        if not shiboken6.isValid(self):
+        if not shiboken6.isValid(self) or self._closing:
             return
         self._fill_parent_window()
         self._place_overlay()

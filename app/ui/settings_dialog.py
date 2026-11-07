@@ -63,6 +63,14 @@ _ACCENT_PRESETS: tuple[tuple[str, str], ...] = (
     ("蓝色", "#39a6d8"),
 )
 
+# 托盘图标颜色选项：取值与色值都来自配置层，界面只负责展示
+_TRAY_COLOR_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("system", "跟随系统"),
+    ("black", "黑色"),
+    ("white", "白色"),
+    ("green", "绿色"),
+)
+
 _TAB_APPEARANCE, _TAB_FEATURES, _TAB_LOCK = 0, 1, 2
 _TAB_TITLES = ("主题界面", "应用功能", "锁屏联动")
 # 切页淡入时长：与主页房间切换同款
@@ -128,7 +136,7 @@ class SettingsDialog(OverlayDialog):
         # 分类展示后单项行更少，面板放大到主窗口约八成，减少滚动
         if parent is not None:
             pw = max(720, int(parent.width() * 0.78))
-            ph = max(520, int(parent.height() * 0.92))
+            ph = max(520, int(parent.height() * 0.95))
         else:
             pw, ph = 720, 520
         panel.setFixedSize(pw, ph)
@@ -205,9 +213,9 @@ class SettingsDialog(OverlayDialog):
         """设置项卡片外壳：返回 (卡片, 标题, 描述, 行布局)，控件由调用方塞入行。"""
         item = QFrame()
         row = QHBoxLayout(item)
-        # 上下 10：锁屏联动页 9 项时，每项省 4px 恰好能把整页压进一屏
+        # 上下 8：锁屏联动页 9 项时，每项省 4px 恰好能把整页压进一屏
         # （真实设备下设备下拉宽 300px 会挤压描述区，比空设备列表更占高）
-        row.setContentsMargins(14, 10, 14, 10)
+        row.setContentsMargins(14, 8, 14, 8)
         row.setSpacing(12)
         texts = QVBoxLayout()
         texts.setContentsMargins(0, 0, 0, 0)
@@ -301,6 +309,43 @@ class SettingsDialog(OverlayDialog):
         accent_row.addLayout(accent_box)
         self._refresh_accent_ui()
 
+        # ── 托盘图标颜色（跟随系统 / 黑 / 白 / 绿） ──
+        self._tray_icon_item, self._tray_icon_label, self._tray_icon_desc, \
+            tray_icon_row = self._make_item(
+                "托盘图标颜色",
+                "任务栏上的图标配色；「跟随系统」按任务栏深浅自动切换，也可固定为黑、白或绿色")
+        self._original_tray_color = settings_store.get_tray_icon_color()
+        self._pending_tray_color = self._original_tray_color
+        tray_box = QHBoxLayout()
+        tray_box.setContentsMargins(0, 0, 0, 0)
+        tray_box.setSpacing(6)
+        self._tray_color_chips: dict[str, QPushButton] = {}
+        for value, label in _TRAY_COLOR_OPTIONS:
+            chip = QPushButton(label)
+            chip.setCheckable(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setFixedHeight(28)
+            color = settings_store.TRAY_ICON_COLORS.get(value)
+            if color:
+                chip.setIcon(qta.icon("mdi.circle", color=color))
+                chip.setIconSize(QSize(12, 12))
+            chip.clicked.connect(
+                lambda _c=False, v=value: self._on_tray_color_picked(v))
+            self._tray_color_chips[value] = chip
+            tray_box.addWidget(chip)
+        self._custom_tray_chip = QPushButton("自定义")
+        self._custom_tray_chip.setCheckable(True)
+        self._custom_tray_chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._custom_tray_chip.setFixedHeight(28)
+        self._custom_tray_chip.setIconSize(QSize(12, 12))
+        self._custom_tray_chip.setToolTip("打开取色板，选任意颜色")
+        self._custom_tray_chip.clicked.connect(self._choose_custom_tray_color)
+        tray_box.addWidget(self._custom_tray_chip)
+        self._tray_hex = QLabel()
+        tray_box.addWidget(self._tray_hex)
+        tray_icon_row.addLayout(tray_box)
+        self._refresh_tray_color_ui()
+
         # ── 界面缩放比例（高 DPI 屏幕微调；更改后重启生效） ──
         self._scale_item, self._scale_label, self._scale_desc, scale_row = self._make_item(
             "界面缩放比例",
@@ -345,21 +390,9 @@ class SettingsDialog(OverlayDialog):
         _sync_switch(self._scene_toggle)
         scene_row.addWidget(self._scene_toggle)
 
-        # ── 隐藏离线设备 ──
-        self._offline_item, self._offline_label, self._offline_desc, offline_row = \
-            self._make_item(
-                "隐藏离线设备",
-                "当前离线的设备不在主页与托盘快捷面板中显示，设备重新上线后自动"
-                "出现；打开设置项（如默认指挥的音箱、锁屏联动）时仍可看到全部设备。"
-                "桌面挂件不受影响")
-        self._offline_toggle = themed_switch()
-        self._offline_toggle.setChecked(settings_store.get_hide_offline_devices())
-        _sync_switch(self._offline_toggle)
-        offline_row.addWidget(self._offline_toggle)
-
         return self._build_scroll([
-            self._theme_item, self._accent_item, self._scale_item,
-            self._fab_item, self._scene_item, self._offline_item,
+            self._theme_item, self._accent_item, self._tray_icon_item,
+            self._scale_item, self._fab_item, self._scene_item,
         ])
 
     def _build_features_page(self) -> QScrollArea:
@@ -444,6 +477,18 @@ class SettingsDialog(OverlayDialog):
         _sync_switch(self._board_toggle)
         board_row.addWidget(self._board_toggle)
 
+        # ── 隐藏离线的设备 ──
+        self._hide_off_item, self._hide_off_label, self._hide_off_desc, \
+            hide_off_row = self._make_item(
+                "隐藏离线的设备",
+                "离线的设备不在主页与托盘快捷面板中显示，重新上线后自动出现；"
+                "打开设置项（如默认指挥的音箱、锁屏联动）时仍可看到全部设备。"
+                "桌面挂件不受影响")
+        self._hide_off_toggle = themed_switch()
+        self._hide_off_toggle.setChecked(settings_store.get_hide_offline_devices())
+        _sync_switch(self._hide_off_toggle)
+        hide_off_row.addWidget(self._hide_off_toggle)
+
         # ── 隐藏无可控制功能的设备 ──
         self._hide_item, self._hide_label, self._hide_desc, hide_row = self._make_item(
             "隐藏无可控制功能的设备",
@@ -465,8 +510,8 @@ class SettingsDialog(OverlayDialog):
 
         return self._build_scroll([
             self._autostart_item, self._speaker_item, self._tray_item,
-            self._start_min_item, self._board_item, self._hide_item,
-            self._update_item,
+            self._start_min_item, self._board_item, self._hide_off_item,
+            self._hide_item, self._update_item,
         ])
 
     def _build_lock_page(self) -> QScrollArea:
@@ -609,7 +654,7 @@ class SettingsDialog(OverlayDialog):
             self._lock_unlock_item, self._lock_lock_item,
             self._lock_time_item, self._lock_span_item,
             self._lock_net_item, self._lock_netname_item,
-        ], spacing=5)
+        ], spacing=4)
 
     # ---------- 分类切换 ----------
 
@@ -666,9 +711,9 @@ class SettingsDialog(OverlayDialog):
         panel_card = f"QFrame {{ background: {SiColors.CARD}; border-radius: 10px; }}"
         for item in (self._tray_item, self._start_min_item, self._fab_item,
                      self._scene_item, self._theme_item, self._autostart_item,
-                     self._speaker_item, self._hide_item, self._scale_item,
-                     self._update_item, self._board_item, self._accent_item,
-                     self._offline_item,
+                     self._speaker_item, self._hide_item, self._hide_off_item,
+                     self._scale_item, self._update_item, self._board_item,
+                     self._accent_item, self._tray_icon_item,
                      self._lock_item, self._lock_device_item,
                      self._lock_startup_item,
                      self._lock_unlock_item, self._lock_lock_item,
@@ -683,10 +728,11 @@ class SettingsDialog(OverlayDialog):
             f"color: {SiColors.TEXT_PRIMARY}; background: transparent;")
         for label in (self._tray_label, self._start_min_label, self._fab_label,
                       self._scene_label, self._theme_label, self._autostart_label,
-                      self._speaker_label, self._hide_label, self._scale_label,
-                      self._update_label, self._board_label, self._accent_label,
-                      self._offline_label,
+                      self._speaker_label, self._hide_label, self._hide_off_label,
+                      self._scale_label, self._update_label, self._board_label,
+                      self._accent_label, self._tray_icon_label,
                       self._lock_label, self._lock_device_label,
+                      self._lock_startup_label,
                       self._lock_unlock_label, self._lock_lock_label,
                       self._lock_time_label, self._lock_span_label,
                       self._lock_net_label, self._lock_netname_label):
@@ -694,10 +740,11 @@ class SettingsDialog(OverlayDialog):
                 f"color: {SiColors.TEXT_PRIMARY}; background: transparent; font-size: 10pt;")
         for desc in (self._tray_desc, self._start_min_desc, self._fab_desc,
                      self._scene_desc, self._theme_desc, self._autostart_desc,
-                     self._speaker_desc, self._hide_desc, self._scale_desc,
-                     self._update_desc, self._board_desc, self._accent_desc,
-                     self._offline_desc,
+                     self._speaker_desc, self._hide_desc, self._hide_off_desc,
+                     self._scale_desc, self._update_desc, self._board_desc,
+                     self._accent_desc, self._tray_icon_desc,
                      self._lock_desc, self._lock_device_desc,
+                     self._lock_startup_desc,
                      self._lock_unlock_desc, self._lock_lock_desc,
                      self._lock_time_desc, self._lock_span_desc,
                      self._lock_net_desc, self._lock_netname_desc):
@@ -745,6 +792,8 @@ class SettingsDialog(OverlayDialog):
         # 主题色按钮与色号提示（内联样式为构造期求值，切主题要重刷）
         self._refresh_accent_ui()
         self._style_accent_chips()
+        self._refresh_tray_color_ui()
+        self._style_tray_color_chips()
 
     def _apply_autostart_state(self, supported: bool) -> None:
         """开发模式下灰置自启动行（开关透明度 + 文字变灰）。"""
@@ -821,6 +870,60 @@ class SettingsDialog(OverlayDialog):
         from app.ui.si_theme import apply_switch_theme
         for switch in self.findChildren(SiSwitchRefactor):
             apply_switch_theme(switch)
+
+    def _choose_custom_tray_color(self) -> None:
+        """打开取色板选任意颜色，与主题色的自定义入口同一套交互。"""
+        current = self._pending_tray_color
+        if current.startswith("#"):
+            initial = QColor(current)
+        else:
+            initial = QColor(settings_store.TRAY_ICON_COLORS.get(current, "#ffffff"))
+        if not initial.isValid():
+            # 取色板对无效初值会退回黑色，这里显式给个可用的默认
+            initial = QColor("#ffffff")
+        picked = QColorDialog.getColor(initial, self, "选择托盘图标颜色")
+        if picked.isValid():
+            self._on_tray_color_picked(picked.name().lower())
+
+    def _on_tray_color_picked(self, value: str) -> None:
+        """选了托盘图标颜色：立即应用并重画图标，保存时才落盘。"""
+        self._pending_tray_color = value
+        self._refresh_tray_color_ui()
+        win = self.parent()
+        if hasattr(win, "apply_tray_icon_color"):
+            # 传新值而不是让主窗口读设置：此刻还没保存，读到的还是旧值
+            win.apply_tray_icon_color(value)
+
+    def _refresh_tray_color_ui(self) -> None:
+        current = self._pending_tray_color
+        for value, chip in self._tray_color_chips.items():
+            chip.setChecked(value == current)
+        # 预设之外的值一律归到「自定义」：色号回显选中的颜色
+        custom = current.startswith("#")
+        self._custom_tray_chip.setChecked(custom)
+        self._custom_tray_chip.setIcon(qta.icon(
+            "mdi.palette",
+            color=current if custom else SiColors.TEXT_SECONDARY))
+        # 与「控件主题色」那行一致：始终回显当前色号，跟随系统没有固定色值
+        if custom:
+            self._tray_hex.setText(current.upper())
+        else:
+            self._tray_hex.setText(
+                settings_store.TRAY_ICON_COLORS.get(current, "").upper())
+
+    def _style_tray_color_chips(self) -> None:
+        """与主题色块同一套按钮样式，保证两行视觉一致。"""
+        qss = (
+            f"QPushButton {{ background: {SiColors.CTRL_BG};"
+            f" border: 1px solid {SiColors.CTRL_BORDER}; border-radius: 14px;"
+            f" padding: 2px 10px; color: {SiColors.TEXT_PRIMARY}; font-size: 9pt; }}"
+            f"QPushButton:hover {{ border-color: {SiColors.THEME}; }}"
+            f"QPushButton:checked {{ border: 1px solid {SiColors.THEME};"
+            f" background: {SiColors.CTRL_BG_HOVER}; font-weight: 600; }}")
+        for chip in list(self._tray_color_chips.values()) + [self._custom_tray_chip]:
+            chip.setStyleSheet(qss)
+        self._tray_hex.setStyleSheet(
+            f"color: {SiColors.TEXT_SECONDARY}; background: transparent; font-size: 9pt;")
 
     def _style_accent_chips(self) -> None:
         """主题色按钮样式：主题切换后也走这里刷新（选中态用当前主题色描边）。"""
@@ -901,7 +1004,7 @@ class SettingsDialog(OverlayDialog):
         if self._devices:
             settings_store.set_voice_fab_enabled(self._voice_fab_toggle.isChecked())
         settings_store.set_hide_no_func_devices(self._hide_toggle.isChecked())
-        settings_store.set_hide_offline_devices(self._offline_toggle.isChecked())
+        settings_store.set_hide_offline_devices(self._hide_off_toggle.isChecked())
         # 锁屏联动：整份配置写入（下拉文案反查设置值）；
         # 未选设备时即使勾了启用也不会执行，下次打开设置仍保持勾选状态
         lock_idx = self._lock_device_combo.currentIndex()
@@ -929,6 +1032,7 @@ class SettingsDialog(OverlayDialog):
         # 主题色：与默认绿相同时存空串，保留"跟随默认"的语义
         accent = (self._pending_accent or "").lower()
         settings_store.set_theme_accent("" if accent == DEFAULT_ACCENT.lower() else accent)
+        settings_store.set_tray_icon_color(self._pending_tray_color)
         # 界面缩放：记录是否变化，供保存后提示重启
         old_scale = self._original_ui_scale
         self._scale_changed = abs(self._pending_ui_scale - old_scale) >= 1e-6
@@ -946,12 +1050,18 @@ class SettingsDialog(OverlayDialog):
         if result == QDialog.DialogCode.Rejected:
             changed = (self._pending_mode != self._original_mode
                        or self._pending_accent.lower() != self._original_accent.lower())
+            tray_changed = (self._pending_tray_color
+                            != self._original_tray_color)
+            win = self.parent()
             if changed:
                 self._pending_mode = self._original_mode
                 self._pending_accent = self._original_accent
-                win = self.parent()
                 if hasattr(win, "apply_theme_mode"):
                     win.apply_theme_mode(self._original_mode, self._original_accent)
+            if tray_changed:
+                self._pending_tray_color = self._original_tray_color
+                if hasattr(win, "apply_tray_icon_color"):
+                    win.apply_tray_icon_color()
         super().done(result)
 
     def _apply_speaker_state(self, has_speaker: bool) -> None:

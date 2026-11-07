@@ -25,6 +25,8 @@ class DeviceInfo:
     room_name: str
     online: bool
     spec_type: str = ""
+    # 云端原始名称：用户自定义名称覆盖 name 后，恢复默认时从这里取值
+    cloud_name: str = ""
 
 
 @dataclass

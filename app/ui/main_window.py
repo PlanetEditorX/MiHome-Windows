@@ -17,9 +17,28 @@ from datetime import datetime
 from pathlib import Path
 
 import shiboken6
-from PySide6.QtCore import QEvent, QPropertyAnimation, QPoint, QSize, Qt, QTimer
+from PySide6.QtCore import (
+    QEvent,
+    QMimeData,
+    QPoint,
+    QPropertyAnimation,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+)
 from PySide6.QtWidgets import QGraphicsOpacityEffect
-from PySide6.QtGui import QAction, QFont, QIcon
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QDrag,
+    QFont,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -39,17 +58,18 @@ from app.siui.components.button import SiToggleButtonRefactor
 import qtawesome as qta
 
 from app.core import cache as device_cache
-from app.core import icon_store, schedule_store
+from app.core import icon_store, name_override_store, schedule_store, settings_store
 from app.core.jobs import PRIORITY_CONTROL, PRIORITY_IDLE, JobExecutor
 from app.core.lock_automation import LockAutomation
 from app.core.models import AutomationInfo, DeviceInfo, SceneInfo, is_speaker
 from app.core.scheduler import Scheduler
-from app.core.service import MijiaService
+from app.core.service import MijiaService, format_metric
 from app.core.session_watch import SessionLockWatcher
 from app.ui.board_manager import BoardManagerDialog
 from app.ui.automation_card import AutomationCard
 from app.ui.device_card import DeviceCard
 from app.ui.device_dialog import DeviceDetailDialog
+from app.ui.prop_widgets import FlowLayout
 from app.ui.scene_card import SceneCard
 from app.ui.schedule_dialog import ScheduleDialog
 from app.ui import si_theme
@@ -201,6 +221,8 @@ class MainWindow(QMainWindow):
         self._homes: list[str] = []
         self._current_home: str = ""
         self._current_room = _ALL_ROOMS
+        # 是否已经按设置里的默认标签初始化过房间选择
+        self._room_initialized = False
         self._settings_dialog: SettingsDialog | None = None
         # did -> 开关状态记忆；None 表示确认无开关能力。
         # 探测结论是设备的固有属性，跨家庭/房间/刷新复用；
@@ -208,6 +230,9 @@ class MainWindow(QMainWindow):
         self._known_power: dict[str, bool | None] = {}
         # did -> 环境读数文案（温湿度），随轮询更新、随网格重建回填
         self._metrics: dict[str, str | None] = {}
+        # did -> {属性名: 原始数值}，目前只存温湿度：顶部环境胶囊要用
+        # 真实读数，不能解析被用户自定义过的副标题文案
+        self._climate: dict[str, dict[str, float]] = {}
         # 耗材明细（全屋口径）：不足项数大于 0 时显示提示胶囊
         self._consumables: list[dict] = []
         self._consumable_low = 0
@@ -223,12 +248,12 @@ class MainWindow(QMainWindow):
         # 托盘常驻内存优化：窗口隐藏期间不构建卡片网格（数十个
         # 卡片控件 + 样式约占 20-30MB），标记脏位、首次显示时构建
         self._grid_dirty = False
-        # 隐藏无可控制功能的设备（设置开关，默认关）
-        from app.core.settings_store import get_hide_no_func_devices
+        # 隐藏无可控制功能/离线设备（设置开关，默认关）
+        from app.core.settings_store import (
+            get_hide_no_func_devices, get_hide_offline_devices)
         self._hide_no_func = get_hide_no_func_devices()
-        # 隐藏离线设备（设置开关，默认关）：主页网格与托盘快捷面板不展示
-        # 当前不可达的设备，重新上线后自动出现
-        from app.core.settings_store import get_hide_offline_devices
+        # 离线设备的隐藏口径：主页网格与托盘快捷面板不展示当前不可达的
+        # 设备，重新上线后自动出现
         self._hide_offline = get_hide_offline_devices()
         # 场景选项卡（设置开关，默认开）与场景视图状态：
         # _scenes 为 None 表示尚未加载，空列表为「确认无场景」
@@ -362,6 +387,7 @@ class MainWindow(QMainWindow):
         self._refresh_btn.clicked.connect(self.load_devices)
         self._settings_btn = _IconButton("mdi.cog-outline", "设置", self)
         self._settings_btn.clicked.connect(self.show_settings)
+
         self._more_menu = QMenu()
         self._more_menu.addAction("托盘管理").triggered.connect(self.show_tray_manager)
         self._more_menu.addAction("定时任务").triggered.connect(self.show_schedules)
@@ -393,10 +419,19 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(btn_wrapper)
         content.addLayout(top_bar)
 
-        # ---- 房间 tab 行 ----
+        # ---- 房间 tab 行：标签流式排列，放不下自动换行 ----
         self._tab_row = QHBoxLayout()
-        self._tab_row.setSpacing(14)
+        self._tab_row.setSpacing(10)
+        # 右侧多留一截：排序按钮要与顶栏那组图标按钮的右边缘对齐
+        self._tab_row.setContentsMargins(0, 0, 25, 0)
         self._tab_buttons: dict[str, SiToggleButtonRefactor] = {}
+        # 标签数量与宽度都不固定，用流式布局让它们像设备卡片一样自动换行；
+        # 排序按钮单独固定在右侧，不参与换行
+        self._tab_flow = FlowLayout(margin=0, spacing=14)
+        self._tab_row.addLayout(self._tab_flow, stretch=1)
+        self._sort_btn = self._make_tab_sort_button()
+        self._tab_row.addWidget(
+            self._sort_btn, alignment=Qt.AlignmentFlag.AlignTop)
         content.addLayout(self._tab_row)
 
         # ---- 环境状态胶囊：房间栏下方一行，点击看明细 ----
@@ -410,10 +445,18 @@ class MainWindow(QMainWindow):
             "mdi.circle-slice-8", "耗材不足的设备", self._show_consumable_detail)
         self._status_row = QHBoxLayout()
         self._status_row.setSpacing(8)
+        # 排序模式的退出入口：只在排序模式下出现，贴在状态行右侧
+        self._sort_exit_btn = QPushButton("完成")
+        self._sort_exit_btn.setFixedHeight(26)
+        self._sort_exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sort_exit_btn.setToolTip("退出排序，恢复点击打开详情")
+        self._sort_exit_btn.clicked.connect(self._exit_sort_mode)
+        self._sort_exit_btn.hide()
         for pill in (self._temp_pill, self._humidity_pill,
                      self._light_pill, self._consumable_pill):
             self._status_row.addWidget(pill)
         self._status_row.addStretch(1)
+        self._status_row.addWidget(self._sort_exit_btn)
         content.addLayout(self._status_row)
 
         # ---- 卡片滚动区 ----
@@ -426,6 +469,15 @@ class MainWindow(QMainWindow):
         # 布局只创建一次，重建网格时仅清空条目；反复替换布局会因
         # deleteLater 的延迟执行陷入死循环
         from PySide6.QtWidgets import QGridLayout
+        # 卡片长按拖拽排序：网格容器接收拖放，落点由主窗口统一计算
+        self._grid_host.setAcceptDrops(True)
+        self._grid_host.installEventFilter(self)
+        self._drag_card_did: str | None = None
+        self._drag_scene_id: str | None = None
+        self._drag_hover_did: str | None = None
+        # 排序模式：长按卡片进入，期间所有卡片显示拖拽手柄、点击不再
+        # 打开详情，直到点顶部退出按钮或拖动一次结束
+        self._sort_mode = False
         self._grid = QGridLayout(self._grid_host)
         self._grid.setContentsMargins(0, 4, 0, 12)
         self._grid.setSpacing(14)
@@ -485,10 +537,18 @@ class MainWindow(QMainWindow):
                      self._light_pill, self._consumable_pill):
             pill.setStyleSheet(pill_qss)
             pill.setIcon(qta.icon(pill._icon_name, color=SiColors.TEXT_SECONDARY))
+        # 排序模式的「完成」按钮：与胶囊同高，用主题色实心强调"点这里退出"
+        self._sort_exit_btn.setStyleSheet(
+            f"QPushButton {{ background: {SiColors.THEME}; border: none;"
+            " border-radius: 13px; padding: 0 16px;"
+            f" color: {SiColors.ON_THEME_TEXT}; font-size: 9pt;"
+            " font-weight: 600; }"
+            "QPushButton:hover { border: none; }")
         self._more_menu.setStyleSheet(
             f"QMenu {{ background: {SiColors.CARD}; border: 1px solid {SiColors.BTN_HOVER}; border-radius: 8px; padding: 4px; }}"
             f"QMenu::item {{ color: {SiColors.TEXT_PRIMARY}; padding: 6px 24px 6px 12px; border-radius: 4px; }}"
             f"QMenu::item:selected {{ background: {SiColors.BTN_HOVER}; }}")
+
         for btn in (self._refresh_btn, self._settings_btn, self._more_btn):
             btn.retheme()
 
@@ -503,6 +563,17 @@ class MainWindow(QMainWindow):
         """系统深浅色变化：托盘图标跟随任务栏底色，与应用主题无关。"""
         if self._tray is not None:
             self._tray.apply_system_icon_theme(scheme)
+
+    def apply_tray_icon_color(self, choice: str | None = None) -> None:
+        """设置页改了托盘图标颜色：立即按当前系统深浅重画一次。
+
+        choice 是设置页刚点选、还没保存的颜色；传 None 表示按已保存
+        的设置刷新（例如取消时还原）。
+        """
+        if self._tray is None:
+            return
+        self._tray.apply_system_icon_theme(
+            self._theme_ctrl.system_scheme(), choice)
 
     def _on_theme_changed(self, theme: str) -> None:
         """主题切换广播：重建可重建结构并刷新固定件。"""
@@ -1046,6 +1117,7 @@ class MainWindow(QMainWindow):
 
     def _apply_devices(self, devices: list[DeviceInfo]) -> None:
         self._all_devices = devices
+        self._apply_custom_names()
         homes = sorted(
             {d.home_name for d in devices},
             key=lambda h: (h == "未知", h),
@@ -1053,7 +1125,13 @@ class MainWindow(QMainWindow):
         self._homes = [_ALL_HOMES] + homes
         if self._current_home not in self._homes:
             self._current_home = self._homes[0] if self._homes else _ALL_HOMES
-        self._current_room = _ALL_ROOMS
+        # 默认标签只在首次加载时应用：之后刷新设备要保持用户当前看的
+        # 房间，否则点一次刷新就被拽回默认页；房间消失时退回全屋
+        if not self._room_initialized:
+            self._current_room = self._preferred_room()
+            self._room_initialized = True
+        elif self._current_room not in self._natural_tabs():
+            self._current_room = _ALL_ROOMS
         self._home_btn.setText(f"{self._current_home} ▾")
         self._rebuild_tabs()
         self._rebuild_grid()
@@ -1063,6 +1141,9 @@ class MainWindow(QMainWindow):
         self._update_voice_fab()
         self._update_tray_devices()
         self._update_board_devices()
+        # 本地化必须在列表落地后立即跑一次：只在开关轮询回调里触发的话，
+        # 无开关设备（手环、牙刷）可能永远等不到，界面就一直是英文名
+        self._maybe_localize_names()
         self._load_card_icons()
         # 场景入口开启时启动即预取场景列表，进场景页无需等待
         if self._show_scene_tab:
@@ -1109,6 +1190,18 @@ class MainWindow(QMainWindow):
             if card.device.model == model:
                 card.set_icon(Path(path))
 
+    def _apply_custom_names(self) -> None:
+        """用本地自定义名称覆盖设备显示名。
+
+        云端名单独存一份到 cloud_name，用户恢复默认时直接取回，
+        不必等下一次刷新设备列表。
+        """
+        overrides = name_override_store.load_all()
+        for device in self._all_devices:
+            if not device.cloud_name:
+                device.cloud_name = device.name
+            device.name = overrides.get(device.did) or device.cloud_name
+
     def _maybe_localize_names(self) -> None:
         """未改名英文设备用中文名替换显示名（两个来源按序兜底）。
 
@@ -1122,10 +1215,20 @@ class MainWindow(QMainWindow):
         if not self._all_devices:
             return
         try:
-            names_now = {d.did: d.name for d in self._all_devices}
+            # 有自定义名的设备不参与本地化：用户改的名字优先级最高，
+            # 否则英文自定义名会被规格里的中文名替换掉，主页与详情页
+            # 显示的名字就会不一致
+            overrides = name_override_store.load_all()
+            ascii_devices = [d for d in self._all_devices
+                             if d.name.isascii() and d.model
+                             and d.did not in overrides]
+            # 这个方法挂在开关轮询回调上，几秒一次；没有需要本地化的
+            # 设备就立刻返回，别做无谓的字典构建与规格遍历
+            if not ascii_devices:
+                return
+            names_now = {d.did: d.name for d in ascii_devices}
             replacements = self._service.localized_product_names(
                 list(names_now), names_now)
-            ascii_devices = [d for d in self._all_devices if d.name.isascii() and d.model]
             model_to_did = {d.model: d.did for d in ascii_devices}
             models = sorted(model_to_did)
             if models:
@@ -1136,7 +1239,7 @@ class MainWindow(QMainWindow):
             logger.exception("本地化设备名失败")
             return
         if replacements:
-            if self._apply_display_names(replacements):
+            if self._apply_display_names(replacements, overrides):
                 return  # 已重建并同步托盘
         # 仍有未解析的型号 → 提交一次后台查询（防重入）
         # 走 _web_jobs：产品页单次实测 2.4 秒、超时 30 秒，绝不能在
@@ -1154,13 +1257,24 @@ class MainWindow(QMainWindow):
                 priority=PRIORITY_IDLE,
             )
 
-    def _apply_display_names(self, replacements: dict[str, str]) -> bool:
-        """把替换名写入设备对象并重建展示；返回是否有实际变化。"""
+    def _apply_display_names(self, replacements: dict[str, str],
+                             overrides: dict[str, str]) -> bool:
+        """把替换名写入设备对象并重建展示；返回是否有实际变化。
+
+        这里再挡一次有自定义名的设备：用户改的名字优先级最高，
+        即使调用方漏过滤，也不能被规格里的中文名覆盖。
+        overrides 由调用方传入，省掉一次重复读取。
+        """
         changed = False
         for d in self._all_devices:
+            if d.did in overrides:
+                continue
             new_name = replacements.get(d.did)
             if new_name and new_name != d.name:
                 d.name = new_name
+                # 本地化后的名字才是"没有自定义名时该显示的名字"，
+                # cloud_name 要同步，否则恢复默认会退回云端英文名
+                d.cloud_name = new_name
                 changed = True
         if not changed:
             return False
@@ -1171,6 +1285,8 @@ class MainWindow(QMainWindow):
         for d in self._all_devices:
             if by_name.get(d.name, 0) > 1 and d.did in replacements:
                 d.name = f"{d.name}·{d.did[-3:]}"
+                # 加尾号后的名字同样是默认展示名，cloud_name 跟着走
+                d.cloud_name = d.name
         self._rebuild_grid()
         self._update_count_label()
         self._update_tray_devices()
@@ -1188,7 +1304,12 @@ class MainWindow(QMainWindow):
 
     def _update_tray_devices(self) -> None:
         if self._tray is not None:
-            self._tray.set_devices(self._displayed_devices(), self._known_power)
+            try:
+                self._tray.set_devices(
+                    self._displayed_devices(), self._known_power)
+            except Exception:
+                # 托盘窗口可能在关闭动画里，同步失败不影响主界面
+                logger.warning("同步托盘设备失败", exc_info=True)
 
     def _update_board_devices(self) -> None:
         """设备列表 / 开关状态变化后同步桌面挂件。
@@ -1423,11 +1544,14 @@ class MainWindow(QMainWindow):
         # 「桌面挂件」开关可能刚被切换：立即生效（开启即显示、关闭即隐藏），
         # 同时刷新两个菜单里的挂件入口
         self._apply_board_enabled()
-        # “隐藏无可控制功能的设备”开关可能变化：重载并刷新展示
-        from app.core.settings_store import get_hide_no_func_devices
+        # 两个隐藏开关可能变化：重载并刷新展示
+        from app.core.settings_store import (
+            get_hide_no_func_devices, get_hide_offline_devices)
         new_hide = get_hide_no_func_devices()
-        if new_hide != self._hide_no_func:
+        new_hide_off = get_hide_offline_devices()
+        if new_hide != self._hide_no_func or new_hide_off != self._hide_offline:
             self._hide_no_func = new_hide
+            self._hide_offline = new_hide_off
             self._rebuild_tabs()
             self._rebuild_grid()
             self._update_count_label()
@@ -1549,18 +1673,21 @@ class MainWindow(QMainWindow):
         切到某个房间后自然变成该房间内的第一台，不需要额外聚合。
         开启数只统计当前范围内状态确认为开的设备。
         """
-        # 温度与湿度分开显示：取第一个能读到对应数值的设备
+        # 取第一个能读到温湿度的设备。这里读 _climate 里的原始值，
+        # 不能解析副标题文案：那可能已被改成显示功率，解析出来是错的
         temp_text = ""
         humidity_text = ""
         for device in subset:
-            value = self._metrics.get(device.did)
-            if not value:
+            values = self._climate.get(device.did)
+            if not values:
                 continue
-            temp, humidity = _split_metrics(value)
-            if not temp_text and temp:
-                temp_text = temp
-            if not humidity_text and humidity:
-                humidity_text = humidity
+            if not temp_text and "temperature" in values:
+                temp_text = format_metric("temperature", values["temperature"])
+            if not humidity_text:
+                for key in ("relative-humidity", "humidity"):
+                    if key in values:
+                        humidity_text = format_metric(key, values[key])
+                        break
             if temp_text and humidity_text:
                 break
         self._temp_pill.setText(temp_text)
@@ -1808,24 +1935,37 @@ class MainWindow(QMainWindow):
             panel.update_power(did, state)
 
     def _refresh_metrics(self) -> None:
-        """为无开关能力的可见设备批量拉温湿度读数（副标题展示）。
+        """批量拉取卡片副标题的读数。
 
-        有开关的设备副标题保持纯房间名；温湿度计这类设备读 SI 标准
-        temperature/humidity 属性，读数失败静默跳过。
+        默认只读「无开关能力」的设备（温湿度计这类），有开关的设备
+        副标题保持纯房间名。但用户如果给某台设备指定了外显属性
+        （插座改成功率），即使它有开关能力也要读，否则那个值永远
+        不会刷新。
         """
+        selections = settings_store.get_metrics_selection()
+        visible = self._visible_devices()
         dids = [
-            d.did for d in self._visible_devices()
-            if self._known_power.get(d.did) is None
+            d.did for d in visible
+            if self._known_power.get(d.did) is None or d.did in selections
         ]
         if not dids:
             return
+        # 温湿度原始值单独收集：环境胶囊固定展示它们，不能从被用户
+        # 改过的副标题文案里反推。候选集取整个可见范围，规格里没有
+        # 温湿度属性的会被服务层跳过，不会带来额外请求
+        climate: dict[str, dict[str, float]] = {}
+        candidates = [d.did for d in visible]
         self._jobs.submit(
-            lambda: self._service.read_metrics(dids),
-            on_success=self._apply_metrics,
-            on_error=lambda exc: logger.warning("拉取温湿度读数失败: %s", exc),
+            lambda: self._service.read_metrics(
+                dids, selections, climate, candidates),
+            on_success=lambda metrics: self._apply_metrics(metrics, climate),
+            on_error=lambda exc: logger.warning("拉取卡片读数失败: %s", exc),
         )
 
-    def _apply_metrics(self, metrics: dict[str, str | None]) -> None:
+    def _apply_metrics(self, metrics: dict[str, str | None],
+                       climate: dict[str, dict[str, float]] | None = None) -> None:
+        if climate is not None:
+            self._climate.update(climate)
         dirty = False
         for did, text in metrics.items():
             if text:
@@ -1836,7 +1976,8 @@ class MainWindow(QMainWindow):
                 self._metrics.pop(did, None)
                 dirty = True
             card = self._cards.get(did)
-            if card is not None:
+            # 卡片可能在读数回来的路上随网格重建销毁，先确认对象还在
+            if card is not None and shiboken6.isValid(card):
                 card.set_metrics(text)
         if dirty and self._all_devices:
             device_cache.save(self._all_devices, self._known_power, self._metrics)
@@ -1859,9 +2000,55 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _on_device_name_changed(self, did: str) -> None:
+        """详情页改了设备名：同步设备对象并刷新所有展示入口。
+
+        这里只改对应卡片的标题文字，不重建整个网格：改名信号来自
+        详情页的信号栈，此刻删卡片会让正在处理点击的控件提前销毁，
+        关闭详情页时容易连带崩溃。
+        """
+        device = next((d for d in self._all_devices if d.did == did), None)
+        if device is None:
+            return
+        custom = name_override_store.get(did)
+        # cloud_name 为空说明还没跑过 _apply_custom_names（旧缓存数据），
+        # 此时先把当前名字当作默认名，避免恢复默认时无值可退
+        if not device.cloud_name:
+            device.cloud_name = device.name
+        device.name = custom or device.cloud_name
+        card = self._cards.get(did)
+        # 卡片可能已随网格重建被销毁，先确认底层对象还在
+        if card is not None and shiboken6.isValid(card):
+            card.set_display_name(device.name)
+        # 托盘与挂件是独立窗口，重建它们不涉及当前点击事件的控件
+        self._update_tray_devices()
+        self._update_board_devices()
+        if self._all_devices:
+            device_cache.save(self._all_devices, self._known_power, self._metrics)
+
+    def _on_metrics_config_changed(self, did: str) -> None:
+        """详情页改了卡片外显：清掉旧文案并按新选择重读一次。"""
+        if self._metrics.pop(did, None) is not None:
+            card = self._cards.get(did)
+            if card is not None and shiboken6.isValid(card):
+                card.set_metrics(None)
+            # 缓存里也要同步清掉，否则下次启动会先把旧文案贴回卡片
+            if self._all_devices:
+                device_cache.save(
+                    self._all_devices, self._known_power, self._metrics)
+        self._refresh_metrics()
+
     def _on_detail_metrics(self, did: str, text: str) -> None:
-        """详情页回读到温湿度后立即回写卡片与缓存（手动刷新路径）。"""
+        """详情页回读到温湿度后立即回写卡片与缓存（手动刷新路径）。
+
+        用户给这台设备挑过别的外显属性（比如功率）时不回写：详情页
+        始终只读温湿度，写回去会把卡片上的自定义值覆盖掉。
+        """
         if not text:
+            return
+        # 用 in 判断而不是取值的真假：用户选择"不外显"时值是空列表，
+        # 那也是自定义设置，不该被详情页回传的温湿度覆盖
+        if did in settings_store.get_metrics_selection():
             return
         if self._metrics.get(did) == text:
             return
@@ -1894,6 +2081,23 @@ class MainWindow(QMainWindow):
         if self._hide_offline and not device.online:
             return False
         return not self._hide_no_func or self._device_has_functions(device)
+
+    def _ordered_devices(self) -> list[DeviceInfo]:
+        """当前可见设备的展示顺序。
+
+        在线优先始终是第一级，手动拖拽只调整同一组内部的先后：这样
+        设备掉线会自动沉到底部，不会因为拖过一次就卡在原来的位置。
+        没有手动顺序时，组内按名称排。
+        """
+        saved = settings_store.get_device_order()
+        rank = {did: i for i, did in enumerate(saved)}
+        # 未记入手动顺序的设备排在已记入的之后，但仍在同一在线分组内
+        unknown = len(rank)
+        return sorted(
+            self._visible_devices(),
+            key=lambda d: (0 if d.online else 1, rank.get(d.did, unknown),
+                           d.name),
+        )
 
     def _device_has_functions(self, device: DeviceInfo) -> bool:
         """None（spec 未拉取）视为有——等首轮轮询证实后再隐藏。"""
@@ -1978,27 +2182,93 @@ class MainWindow(QMainWindow):
     # ---------- 房间 tab ----------
 
     def _rebuild_tabs(self) -> None:
-        # 彻底清空布局条目（含 stretch）：只删按钮会残留 stretch 项，
-        # 每次切换家庭都会把新按钮往右推一格
-        while self._tab_row.count():
-            item = self._tab_row.takeAt(0)
+        # 只清标签，保留右侧的排序按钮（它不属于标签集合）
+        while self._tab_flow.count():
+            item = self._tab_flow.takeAt(0)
             if widget := item.widget():
+                # deleteLater 是延迟删除，旧按钮会和新按钮同帧显示；
+                # 先隐藏掉，重建过程中不会出现重影
+                widget.hide()
                 widget.deleteLater()
         self._tab_buttons.clear()
 
-        rooms = ([_SCENE_TAB] if self._show_scene_tab else []) + [_ALL_ROOMS] + sorted({
+        for room in self._ordered_tabs(self._natural_tabs()):
+            btn = themed_tab_button(room)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _, r=room: self._select_room(r))
+            self._tab_flow.addWidget(btn)
+            self._tab_buttons[room] = btn
+        self._sync_tab_style()
+
+    def _preferred_room(self) -> str:
+        """启动后打开的标签：设置里指定的优先，已不存在时退回全屋。"""
+        saved = settings_store.get_default_tab()
+        if saved and saved in self._natural_tabs():
+            return saved
+        return _ALL_ROOMS
+
+    def _natural_tabs(self) -> list[str]:
+        """标签的自然顺序：场景、全屋，其余房间按名称排列。
+
+        这是「没有自定义顺序」时的默认排法，恢复默认与新增标签兜底
+        都以它为准。
+        """
+        return ([_SCENE_TAB] if self._show_scene_tab else []) + [_ALL_ROOMS] + sorted({
             d.room_name for d in self._all_devices
             if (self._current_home == _ALL_HOMES or d.home_name == self._current_home)
             and d.room_name and d.room_name != "未知"
         }) + [_AUTO_TAB]
-        for room in rooms:
-            btn = themed_tab_button(room)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _, r=room: self._select_room(r))
-            self._tab_row.addWidget(btn)
-            self._tab_buttons[room] = btn
-        self._tab_row.addStretch(1)
-        self._sync_tab_style()
+
+    @staticmethod
+    def _ordered_tabs(tabs: list[str]) -> list[str]:
+        """按保存的顺序排标签，新出现的追加到末尾。
+
+        保存的顺序只记名字；换家庭后房间集合会变，没出现在记录里的
+        标签保持默认顺序接在后面，不会因为排序丢失入口。
+        """
+        saved = settings_store.get_room_order()
+        if not saved:
+            return list(tabs)
+        index = {name: pos for pos, name in enumerate(saved)}
+        known = sorted((t for t in tabs if t in index), key=lambda t: index[t])
+        rest = [t for t in tabs if t not in index]
+        return known + rest
+
+    def _make_tab_sort_button(self) -> QPushButton:
+        """标签行最右端的排序入口。"""
+        btn = QPushButton()
+        # 这个入口嵌在标签行右侧、周围没有别的控件衬托，做太小很难注意到
+        btn.setFixedSize(34, 34)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip("调整标签顺序")
+        btn.setIconSize(QSize(26, 26))
+        btn.setIcon(qta.icon("mdi.sort-variant", color=SiColors.TEXT_SECONDARY))
+        btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none;"
+            " border-radius: 8px; }"
+            f"QPushButton:hover {{ background: {SiColors.BTN_HOVER}; }}")
+        btn.clicked.connect(self._open_room_order)
+        return btn
+
+    def _open_room_order(self) -> None:
+        """打开标签排序对话框，确定后立即重建标签行。"""
+        from app.ui.room_order_dialog import RoomOrderDialog
+
+        current = list(self._tab_buttons.keys())
+        defaults = self._natural_tabs()
+        dlg = RoomOrderDialog(current, defaults, self)
+        accepted = dlg.exec() == RoomOrderDialog.DialogCode.Accepted
+        order = dlg.result_order()
+        restored = dlg.restored_default()
+        default_tab = dlg.default_tab()
+        dlg.deleteLater()
+        if not accepted:
+            return
+        # 恢复默认时写空表，让新出现的房间继续按自然顺序排在后面；
+        # 若把当时的顺序固化下来，以后新增房间就不会自动归位
+        settings_store.set_room_order([] if restored else order)
+        settings_store.set_default_tab(default_tab)
+        self._rebuild_tabs()
 
     def _select_room(self, room: str) -> None:
         self._current_room = room
@@ -2061,10 +2331,8 @@ class MainWindow(QMainWindow):
             self._rebuild_automation_grid()
             return
 
-        visible = sorted(
-            self._visible_devices(),
-            key=lambda d: (0 if d.online else 1, d.name),
-        )
+        # 展示顺序：在线优先 + 手动拖拽顺序（见 _ordered_devices）
+        visible = self._ordered_devices()
         if not visible:
             # 空态：常见于「隐藏离线设备」开启后某房间只剩离线设备。
             # 不提示的话用户会以为列表加载失败
@@ -2093,13 +2361,31 @@ class MainWindow(QMainWindow):
                 card.set_icon(path)
             card.power_clicked.connect(self._on_power_clicked)
             card.open_requested.connect(self._on_open_device)
+            card.drag_requested.connect(self._start_card_drag)
+            card.sort_mode_requested.connect(self._enter_sort_mode)
+            if self._sort_mode:
+                card.set_sort_mode(True)
             self._cards[device.did] = card
             self._grid.addWidget(card, index // cols, index % cols)
         self._finalize_grid(cols, rows)
 
+    def _ordered_scenes(self) -> list[SceneInfo]:
+        """场景展示顺序：手动拖过的按记录的先后，其余按名称追加。
+
+        与设备卡片同一套思路：只把用户排过的记进设置，没记过的
+        保持默认排法，新增场景不必手动拖也能落到末尾。
+        """
+        saved = settings_store.get_scene_order()
+        rank = {sid: i for i, sid in enumerate(saved)}
+        unknown = len(rank)
+        return sorted(
+            self._scenes or [],
+            key=lambda s: (rank.get(s.scene_id, unknown), s.name),
+        )
+
     def _rebuild_scene_grid(self) -> None:
         """场景视图网格：卡片尺寸与设备卡一致，列数换算直接复用。"""
-        scenes = sorted(self._scenes or [], key=lambda s: s.name)
+        scenes = self._ordered_scenes()
         if not scenes:
             # 空状态：居中提示（含「确认无场景」与加载失败两种来源）
             hint = QLabel("暂无场景，可在米家 APP「智能」中添加")
@@ -2116,6 +2402,10 @@ class MainWindow(QMainWindow):
         for index, scene in enumerate(scenes):
             card = SceneCard(scene)
             card.executed.connect(self._on_scene_executed)
+            card.drag_requested.connect(self._start_scene_drag)
+            card.sort_mode_requested.connect(self._enter_sort_mode)
+            if self._sort_mode:
+                card.set_sort_mode(True)
             self._scene_cards[scene.scene_id] = card
             self._grid.addWidget(card, index // cols, index % cols)
         self._finalize_grid(cols, rows)
@@ -2280,7 +2570,215 @@ class MainWindow(QMainWindow):
                 and event.type() == QEvent.Type.Resize
                 and self.isVisible()):
             self._resize_timer.start()
+        elif obj is self._grid_host and (self._drag_card_did
+                                         or self._drag_scene_id):
+            etype = event.type()
+            if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                self._highlight_drop_target()
+                event.acceptProposedAction()
+                return True
+            if etype == QEvent.Type.Drop:
+                if self._drag_scene_id:
+                    self._apply_scene_drop()
+                else:
+                    self._apply_card_drop()
+                event.acceptProposedAction()
+                return True
+            if etype == QEvent.Type.DragLeave:
+                self._clear_drop_highlight()
         return super().eventFilter(obj, event)
+
+    # ---------- 卡片拖拽排序 ----------
+
+    def _drag_pixmap(self, card: QWidget) -> QPixmap:
+        """把卡片渲染成圆角浮起图，供拖拽时跟手显示。
+
+        grab() 得到的是整块不透明矩形，圆角外被填成卡片底色，直接
+        当拖拽图会出现两侧黑角。这里按圆角把卡片内容重新合成到透明
+        画布上，圆角外才是真正透明。
+        """
+        card_shot = card.grab()
+        # grab() 出来的图带着窗口的 DPR（如 1.25），绘制时会按逻辑尺寸
+        # 缩回去；而下面的裁剪路径是按像素算的，两套坐标不一致就会只
+        # 裁到一个角。先归一到 1.0，让整条链路只用像素坐标。
+        dpr = card_shot.devicePixelRatio()
+        card_shot.setDevicePixelRatio(1.0)
+        pad = 10
+        canvas = QPixmap(card_shot.width() + pad * 2,
+                         card_shot.height() + pad * 2)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # grab() 抓到的四角是不透明底色，直接贴出来就是两块黑角；
+        # 圆角半径按 DPR 放大，缩放显示后才和卡片本身的圆角一致
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(pad, pad, card_shot.width(),
+                                    card_shot.height()), 14 * dpr, 14 * dpr)
+        painter.setClipPath(clip)
+        painter.drawPixmap(pad, pad, card_shot)
+        painter.end()
+        # 合成阶段只认像素，交还给 Qt 前恢复 DPR：这样拖拽图按逻辑尺寸
+        # 摆放、物理像素与屏幕 1:1，放大绘制才会发虚
+        canvas.setDevicePixelRatio(dpr)
+        return canvas
+
+    def _all_grid_cards(self) -> list:
+        """当前网格里的全部卡片：设备与场景两个视图都算，排序模式要一起管。"""
+        cards = list(self._cards.values())
+        cards.extend(self._scene_cards.values())
+        return cards
+
+    def _start_scene_drag(self, scene_id: str) -> None:
+        """场景卡片拖拽：与设备卡片同一套落点与交换逻辑。"""
+        card = self._scene_cards.get(scene_id)
+        if card is None or not shiboken6.isValid(card):
+            return
+        # 先标记来源视图：落点回调靠它决定去查设备还是场景
+        self._drag_scene_id = scene_id
+        self._run_drag(card, scene_id)
+        self._drag_scene_id = None
+
+    def _scene_under_cursor(self) -> str | None:
+        """鼠标当前压在哪个场景卡片上（不含被拖动的自己）。"""
+        pos = self._grid_host.mapFromGlobal(QCursor.pos())
+        for scene_id, card in self._scene_cards.items():
+            if scene_id == self._drag_scene_id:
+                continue
+            if not shiboken6.isValid(card):
+                continue
+            if card.geometry().contains(pos):
+                return scene_id
+        return None
+
+    def _apply_scene_drop(self) -> None:
+        """松手：只调换这两个场景的相对次序。"""
+        source = self._drag_scene_id
+        target = self._scene_under_cursor()
+        self._clear_drop_highlight()
+        if not source or not target or source == target:
+            return
+        order = [s.scene_id for s in self._ordered_scenes()]
+        if source not in order or target not in order:
+            return
+        i, j = order.index(source), order.index(target)
+        order[i], order[j] = order[j], order[i]
+        settings_store.set_scene_order(order)
+        self._rebuild_grid()
+
+    def _enter_sort_mode(self, did: str) -> None:
+        """长按卡片进入排序模式：所有卡片亮出手柄，点击不再打开详情。"""
+        if self._sort_mode:
+            return
+        self._sort_mode = True
+        for card in self._all_grid_cards():
+            if shiboken6.isValid(card):
+                card.set_sort_mode(True)
+        self._sort_exit_btn.show()
+        Toast.info(self, "拖拽卡片可调整顺序，点「完成」退出", 2600)
+
+    def _exit_sort_mode(self) -> None:
+        """退出排序模式：收起手柄，恢复正常点击行为。"""
+        if not self._sort_mode:
+            return
+        self._sort_mode = False
+        for card in self._all_grid_cards():
+            if shiboken6.isValid(card):
+                card.set_sort_mode(False)
+        self._sort_exit_btn.hide()
+
+    def _start_card_drag(self, did: str) -> None:
+        """启动设备卡片拖拽。"""
+        card = self._cards.get(did)
+        if card is None or not shiboken6.isValid(card):
+            return
+        self._drag_card_did = did
+        self._run_drag(card, did)
+        self._drag_card_did = None
+
+    def _run_drag(self, card: QWidget, ident: str) -> None:
+        """设备与场景共用的拖拽执行：抓图、淡出原位、阻塞等待落点。
+
+        调用方负责事先把 _drag_card_did / _drag_scene_id 置成 ident，
+        落点回调靠它区分是哪个视图；exec 返回后由调用方清空。
+        """
+        self._drag_hover_did = None
+        pixmap = self._drag_pixmap(card)
+        # 原位卡片留个若隐若现的占位，避免拖起来后网格塌陷
+        effect = QGraphicsOpacityEffect(card)
+        effect.setOpacity(0.35)
+        card.setGraphicsEffect(effect)
+        drag = QDrag(card)
+        mime = QMimeData()
+        mime.setText(ident)
+        drag.setMimeData(mime)
+        drag.setPixmap(pixmap)
+        # hotSpot 用逻辑坐标：pixmap 带 DPR 时按物理像素算会偏到一边
+        dpr = pixmap.devicePixelRatio()
+        drag.setHotSpot(QPoint(int(pixmap.width() / dpr / 2),
+                               int(pixmap.height() / dpr / 2)))
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            # exec 返回后拖拽结束：恢复原位卡片并清掉落点高亮
+            if shiboken6.isValid(card):
+                card.setGraphicsEffect(None)
+            self._clear_drop_highlight()
+
+    def _card_under_cursor(self) -> str | None:
+        """鼠标当前压在哪个卡片上（不含被拖动的自己）。"""
+        pos = self._grid_host.mapFromGlobal(QCursor.pos())
+        for did, card in self._cards.items():
+            if did == self._drag_card_did:
+                continue
+            if not shiboken6.isValid(card):
+                continue
+            if card.geometry().contains(pos):
+                return did
+        return None
+
+    def _highlight_drop_target(self) -> None:
+        """把落点卡片底色提亮，让用户看清会换到哪一格。"""
+        if self._drag_scene_id:
+            target = self._scene_under_cursor()
+        else:
+            target = self._card_under_cursor()
+        if target == self._drag_hover_did:
+            return
+        self._clear_drop_highlight()
+        self._drag_hover_did = target
+        card = self._grid_card_by_id(target) if target else None
+        if card is not None and shiboken6.isValid(card):
+            card.set_drop_target(True)
+
+    def _grid_card_by_id(self, ident: str):
+        """按 did 或 scene_id 找卡片：两个视图的 id 不会撞。"""
+        card = self._cards.get(ident)
+        return card if card is not None else self._scene_cards.get(ident)
+
+    def _clear_drop_highlight(self) -> None:
+        card = self._grid_card_by_id(self._drag_hover_did) if self._drag_hover_did else None
+        if card is not None and shiboken6.isValid(card):
+            card.set_drop_target(False)
+        self._drag_hover_did = None
+
+    def _apply_card_drop(self) -> None:
+        """松手：只调换这两张卡片的相对次序，其它卡片原地不动。
+
+        落盘的是"按当前显示顺序重排后的完整列表"，这样两两交换不会
+        波及第三方；同时保证后续新增设备仍按默认规则追加到末尾。
+        """
+        source = self._drag_card_did
+        target = self._card_under_cursor()
+        self._clear_drop_highlight()
+        if not source or not target or source == target:
+            return
+        order = [d.did for d in self._ordered_devices()]
+        if source not in order or target not in order:
+            return
+        i, j = order.index(source), order.index(target)
+        order[i], order[j] = order[j], order[i]
+        settings_store.set_device_order(order)
+        self._rebuild_grid()
 
     # ---------- 快速开关 ----------
 
@@ -2482,9 +2980,16 @@ class MainWindow(QMainWindow):
         dialog = DeviceDetailDialog(self._service, self._jobs, device, self)
         # 详情内取到温湿度后直接回写卡片与缓存（手动刷新的即时反馈）
         dialog.panel.metrics_updated.connect(self._on_detail_metrics)
+        dialog.panel.name_changed.connect(self._on_device_name_changed)
+        dialog.panel.metrics_config_changed.connect(self._on_metrics_config_changed)
         dialog.load()
         dialog.exec()
-        dialog.panel.metrics_updated.disconnect(self._on_detail_metrics)
+        # 面板可能随关闭流程提前释放，断开信号前先确认对象还在
+        if shiboken6.isValid(dialog.panel):
+            dialog.panel.name_changed.disconnect(self._on_device_name_changed)
+            dialog.panel.metrics_config_changed.disconnect(
+                self._on_metrics_config_changed)
+            dialog.panel.metrics_updated.disconnect(self._on_detail_metrics)
         dialog.deleteLater()
         # 详情期间可能在面板里改过开关，关闭后读一次回填卡片；
         # 无开关能力的设备返回 None 直接跳过

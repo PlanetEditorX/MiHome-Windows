@@ -113,15 +113,15 @@ settings_store.set_autostart = lambda value: None
 from app.ui.settings_dialog import SettingsDialog
 
 dlg = SettingsDialog(win, devices=list(DEVICES))
-assert dlg._offline_toggle is not None
-assert dlg._offline_toggle.isChecked() is False, "设置页未回显 store 中的关闭状态"
-assert "离线" in dlg._offline_label.text()
+assert dlg._hide_off_toggle is not None
+assert dlg._hide_off_toggle.isChecked() is False, "设置页未回显 store 中的关闭状态"
+assert "离线" in dlg._hide_off_label.text()
 # 切主题色后开关仍在且样式刷新不抛异常（新行必须进 _apply_styles 的三个元组）
 dlg.retheme()
 app.processEvents()
-assert dlg._offline_toggle.isVisible() or dlg._offline_toggle.parent() is not None
+assert dlg._hide_off_toggle.isVisible() or dlg._hide_off_toggle.parent() is not None
 
-dlg._offline_toggle.setChecked(True)
+dlg._hide_off_toggle.setChecked(True)
 dlg._save_and_accept()
 # 遮罩对话框的 accept 走 100ms 淡出动画后才真正 done，等它落地
 from PySide6.QtTest import QTest
@@ -134,8 +134,8 @@ print("5. 设置页回显 / 保存落盘 OK")
 # 再次打开 → 取消：不应写回
 settings_store.set_hide_offline_devices(False)
 dlg2 = SettingsDialog(win, devices=list(DEVICES))
-assert dlg2._offline_toggle.isChecked() is False
-dlg2._offline_toggle.setChecked(True)
+assert dlg2._hide_off_toggle.isChecked() is False
+dlg2._hide_off_toggle.setChecked(True)
 dlg2.done(QDialog.DialogCode.Rejected)
 assert settings_store.get_hide_offline_devices() is False, "取消不应落盘"
 dlg.deleteLater()

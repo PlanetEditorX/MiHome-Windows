@@ -85,6 +85,13 @@ class ThemeController(QObject):
     def mode(self) -> str:
         return self._mode
 
+    def system_scheme(self) -> str:
+        """当前系统配色（"dark"/"light"），与设置里的模式无关。"""
+        from PySide6.QtCore import Qt
+
+        scheme = self._hints.colorScheme()
+        return "light" if scheme == Qt.ColorScheme.Light else "dark"
+
     def set_mode(self, mode: str, accent: str | None = None) -> str:
         """切换设置模式（可选同时换主题色）并立即应用；返回实际生效主题。"""
         self._mode = mode

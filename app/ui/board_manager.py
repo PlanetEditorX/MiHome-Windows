@@ -14,10 +14,9 @@
 也会保留这些调整；点「保存」只决定设备/场景清单是否写入。
 """
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QCheckBox,
     QColorDialog,
     QFrame,
     QHBoxLayout,
@@ -34,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from app.core import board_store
 from app.core.models import DeviceInfo
+from app.ui.check_box import SiCheckBox
 from app.ui.overlay_dialog import OverlayDialog
 from app.ui.room_filter import (
     apply_room_combo_theme,
@@ -62,86 +62,6 @@ _PRESET_BG = (
     ("米白", "#f5f1e8"),
 )
 _SWATCH = 26  # 色块边长
-
-
-class _CheckBox(QCheckBox):
-    """自绘复选框：选中时主题色方块 + 白色对勾。
-
-    原生 QCheckBox 的 indicator 用 QSS 只能填色，选中后没有勾，看不出
-    "已勾选"；QSS 的 image 方案要落地图片文件、换主题色还得重新生成，
-    所以直接画。颜色在 paint 时从调色板取，主题切换自动跟随。
-    """
-
-    _BOX = 15
-    _GAP = 8
-
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        # indicator 与文字都由 paintEvent 画，这里只保留透明背景
-        self.setStyleSheet("QCheckBox { background: transparent; }")
-
-    def sizeHint(self) -> QSize:  # noqa: N802
-        fm = self.fontMetrics()
-        return QSize(
-            self._BOX + self._GAP + fm.horizontalAdvance(self.text()),
-            max(22, fm.height() + 8))
-
-    def minimumSizeHint(self) -> QSize:  # noqa: N802
-        return self.sizeHint()
-
-    def enterEvent(self, event) -> None:  # noqa: N802
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:  # noqa: N802
-        self.update()
-        super().leaveEvent(event)
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        box = QRectF(0, (self.height() - self._BOX) / 2, self._BOX, self._BOX)
-        if self.isChecked():
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(SiColors.THEME))
-            painter.drawRoundedRect(box, 4, 4)
-            # 对勾：两段折线，端点圆头，避免直角显得生硬
-            pen = QPen(QColor(SiColors.ON_THEME_TEXT), 2)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(pen)
-            path = QPainterPath()
-            path.moveTo(box.x() + box.width() * 0.25,
-                        box.y() + box.height() * 0.52)
-            path.lineTo(box.x() + box.width() * 0.43,
-                        box.y() + box.height() * 0.70)
-            path.lineTo(box.x() + box.width() * 0.76,
-                        box.y() + box.height() * 0.31)
-            painter.drawPath(path)
-        else:
-            # 空框的边框比卡片描边亮一档：LINE 在卡片底上几乎看不见，
-            # 未勾选时也要能一眼找到可点的位置
-            border = SiColors.THEME if self.underMouse() else SiColors.TEXT_MUTED
-            painter.setPen(QPen(QColor(border), 1))
-            painter.setBrush(QColor(SiColors.SURFACE))
-            painter.drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
-
-        painter.setPen(QColor(SiColors.TEXT_PRIMARY))
-        text_rect = QRectF(self._BOX + self._GAP, 0,
-                           self.width() - self._BOX - self._GAP, self.height())
-        painter.drawText(
-            text_rect,
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            self.text())
-        # 键盘 Tab 过来时给一圈虚线焦点框：自绘之后原生焦点提示没了，
-        # 只靠鼠标的用户也得看得出当前停在哪个勾选项上
-        if self.hasFocus():
-            painter.setPen(QPen(QColor(SiColors.THEME), 1, Qt.PenStyle.DashLine))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 4, 4)
-        painter.end()
 
 
 class BoardManagerDialog(OverlayDialog):
@@ -786,7 +706,7 @@ class BoardManagerDialog(OverlayDialog):
     def _make_topmost_section(self) -> QWidget:
         """置顶勾选框：不写解释文字（用户都懂"置顶"），说明放进 tooltip。"""
         box, lay = self._make_section_box()
-        self._topmost_check = _CheckBox("窗口置顶")
+        self._topmost_check = SiCheckBox("窗口置顶")
         self._topmost_check.setChecked(board_store.get_topmost())
         self._topmost_check.setToolTip(
             "关闭（默认）：会被其他窗口盖住；开启：始终浮在最上层")
@@ -797,7 +717,7 @@ class BoardManagerDialog(OverlayDialog):
     def _make_lock_section(self) -> QWidget:
         """锁定：隐藏标题栏、禁止拖动、形态固定（解锁入口在挂件上/右键/托盘）。"""
         box, lay = self._make_section_box()
-        self._lock_check = _CheckBox("锁定挂件（隐藏标题栏、固定位置）")
+        self._lock_check = SiCheckBox("锁定挂件（隐藏标题栏、固定位置）")
         self._lock_check.setChecked(board_store.get_locked())
         self._lock_check.setToolTip(
             "锁定后不能拖动、不能收起/展开；鼠标移到挂件上会浮出小锁，"

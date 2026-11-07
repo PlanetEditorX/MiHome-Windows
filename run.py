@@ -10,6 +10,29 @@ import os
 import sys
 import tempfile
 
+
+def _enable_per_monitor_dpi() -> None:
+    """在导入 PySide6 之前把进程 DPI 感知设为 PerMonitorV2。
+
+    Qt 库一加载就会确定进程的 DPI 感知级别，之后再调用
+    SetProcessDpiAwarenessContext 会被系统拒绝（日志里表现为一条
+    「拒绝访问」的警告）。因此这一步必须抢在导入之前完成。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 的句柄值为 -4
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
+
+
+_enable_per_monitor_dpi()
+
 from PySide6.QtCore import QLockFile, QTimer, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -168,8 +191,14 @@ def _install_qt_translator(app) -> None:
 
 def main() -> int:
     # 日志先落地：控制台在运行期是隐藏的，异常与失败只能靠文件留存
-    from app import setup_logging
+    from app import is_packaged, setup_logging
     setup_logging()
+    # 源码模式额外把控制台输出与崩溃堆栈同步写进 app.log：崩溃时
+    # 控制台窗口会一起消失，事后只剩这个文件能提供线索
+    if not is_packaged():
+        from app.core import _json_store
+        from app.diagnostics import setup_console_log
+        setup_console_log(_json_store.data_file("app.log"))
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     _apply_ui_scale_env()

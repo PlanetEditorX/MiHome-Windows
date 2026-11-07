@@ -105,10 +105,10 @@ for name in FEATURE_ITEMS:
     assert card in feature_cards, f"{name} 不在应用功能页"
     assert card not in lock_cards, f"{name} 误入锁屏页"
 assert len(lock_cards) == 9, f"锁屏页卡片数 {len(lock_cards)}"
-assert len(feature_cards) == 7, f"应用功能页卡片数 {len(feature_cards)}"
+assert len(feature_cards) == 8, f"应用功能页卡片数 {len(feature_cards)}"
 # 控件本身必须真的挂在锁屏滚动区下（换页不会把它留在旧页里）
 assert lock_page in ancestor_chain(dlg._lock_time_start), "时间字段未挂在锁屏页"
-print("2. 卡片归属（锁屏 9 / 应用功能 7）OK")
+print("2. 卡片归属（锁屏 9 / 应用功能 8）OK")
 
 # ---------- 3. 切页可见性：只有当前页可见 ----------
 pages = (dlg._appearance_scroll, features_page, lock_page)

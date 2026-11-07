@@ -7,6 +7,7 @@
 保存用户在设置界面中调整的偏好。
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -46,6 +47,7 @@ _DEFAULTS: dict = {
     "lock_automation": {
         "enabled": False,
         "did": "",             # 目标设备 did；空串=尚未选择
+        "startup_action": "none",  # 应用启动时做什么：on / off / none
         "unlock_action": "on",  # 解锁时对该设备做什么：on / off / none
         "lock_action": "off",   # 锁屏时对该设备做什么：on / off / none
         "time_enabled": False,  # 是否限定生效时间段
@@ -54,6 +56,20 @@ _DEFAULTS: dict = {
         "net_enabled": False,   # 是否限定生效网络
         "net_names": [],        # 生效网络名列表（大小写不敏感包含匹配）
     },
+    # 房间标签的自定义顺序（房间名列表）；未列出的房间按名称排在后面
+    "room_order": [],
+    # 启动后默认打开的标签名；空串表示「全屋」
+    "default_tab": "",
+    # did -> 卡片副标题要显示的属性名列表（最多两个）。键不存在表示用
+    # 默认温湿度；值恰好是空列表表示用户明确选择不外显，两者语义不同
+    "metrics_selection": {},
+    # 托盘图标颜色：system 跟随任务栏深浅，其余为固定色
+    "tray_icon_color": "system",
+    # 主页设备卡片的手动顺序（did 列表）。只记录用户拖动过的设备，
+    # 未列出的按默认规则（在线优先 + 名称）排在后面
+    "device_order": [],
+    # 场景卡片的手动顺序（scene_id 列表），语义同 device_order
+    "scene_order": [],
 }
 
 
@@ -69,6 +85,102 @@ def _read_raw() -> dict:
 
 def _write_raw(raw: dict) -> None:
     _json_store.write_json(_json_store.data_file(_FILENAME), raw)
+
+
+# 托盘图标可选颜色与色值，system 表示跟随任务栏深浅。
+# 色值集中在这里：界面色块和托盘染色都从这里取，避免两处各存一份
+TRAY_ICON_COLORS: dict[str, str] = {
+    "black": "#1a1a1a",
+    "white": "#ffffff",
+    "green": "#3dbba4",
+}
+_TRAY_ICON_CHOICES = ("system",) + tuple(TRAY_ICON_COLORS)
+# 自定义颜色的存储格式，与主题色一致（小写 #rrggbb）
+_HEX_COLOR_RE = re.compile(r"#[0-9a-f]{6}")
+
+
+def get_metrics_selection() -> dict[str, list[str]]:
+    """did -> 卡片副标题要显示的属性名列表。
+
+    三种状态靠键是否存在于返回值里区分：没有这个 did 表示从未设置
+    过（用默认温湿度）；值是空列表表示用户明确选择了不外显；值非空
+    则是具体的属性。调用方要用 in / is not None 判断，不能靠真假值。
+    """
+    raw = _read_raw().get("metrics_selection")
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for did, props in raw.items():
+        if isinstance(props, list):
+            result[str(did)] = [str(p) for p in props
+                                if isinstance(p, str) and p][:2]
+    return result
+
+
+def set_metrics_selection(did: str, props: list[str]) -> None:
+    """写入某台设备的副标题属性。
+
+    传空列表表示明确不外显，会保留一条空记录；要恢复默认请调用
+    clear_metrics_selection 把键删掉，两者语义不同。
+    """
+    raw = _read_raw()
+    current = raw.get("metrics_selection")
+    if not isinstance(current, dict):
+        current = {}
+    current[did] = [str(p) for p in props if isinstance(p, str) and p][:2]
+    raw["metrics_selection"] = current
+    _write_raw(raw)
+
+
+def clear_metrics_selection(did: str) -> None:
+    """删掉这台设备的记录，回到默认温湿度。"""
+    raw = _read_raw()
+    current = raw.get("metrics_selection")
+    if not isinstance(current, dict):
+        return
+    if current.pop(did, None) is not None:
+        raw["metrics_selection"] = current
+        _write_raw(raw)
+
+
+def _normalize_tray_color(value: str) -> str:
+    """把用户值规整成内部形式：预设名原样，十六进制统一小写。
+
+    取色板返回的本来就是小写，这里再做一次是为了兼容手动编辑过
+    设置文件、或别处传入大写色值的情况。不认识的值退回 system。
+    """
+    if value in _TRAY_ICON_CHOICES:
+        return value
+    lowered = value.lower()
+    if _HEX_COLOR_RE.fullmatch(lowered):
+        return lowered
+    return "system"
+
+
+def get_tray_icon_color() -> str:
+    """托盘图标颜色：system / black / white / green，或自定义 #rrggbb。"""
+    value = _read_raw().get("tray_icon_color")
+    return _normalize_tray_color(value) if isinstance(value, str) else "system"
+
+
+def set_tray_icon_color(value: str) -> None:
+    """写入托盘图标颜色；不认识的值按 system 处理，避免存脏数据。"""
+    raw = _read_raw()
+    raw["tray_icon_color"] = (_normalize_tray_color(value)
+                              if isinstance(value, str) else "system")
+    _write_raw(raw)
+
+
+def get_default_tab() -> str:
+    """启动后默认打开的标签名；空串表示「全屋」。"""
+    value = _read_raw().get("default_tab")
+    return value if isinstance(value, str) else ""
+
+
+def set_default_tab(name: str) -> None:
+    raw = _read_raw()
+    raw["default_tab"] = str(name or "")
+    _write_raw(raw)
 
 
 def get_minimize_to_tray() -> bool:
@@ -135,6 +247,17 @@ def set_tray_audio_speaker_did(value: str) -> None:
     _write_raw(raw)
 
 
+def get_hide_offline_devices() -> bool:
+    """是否隐藏离线设备，默认关闭。"""
+    return bool(_read_raw().get("hide_offline_devices", False))
+
+
+def set_hide_offline_devices(value: bool) -> None:
+    raw = _read_raw()
+    raw["hide_offline_devices"] = bool(value)
+    _write_raw(raw)
+
+
 def get_hide_no_func_devices() -> bool:
     """是否隐藏无可控制功能的设备（无 spec / spec 无属性），默认关闭。"""
     return bool(_read_raw().get("hide_no_func_devices", False))
@@ -146,14 +269,45 @@ def set_hide_no_func_devices(value: bool) -> None:
     _write_raw(raw)
 
 
-def get_hide_offline_devices() -> bool:
-    """是否隐藏离线设备（主页网格与托盘快捷面板），默认关闭。"""
-    return bool(_read_raw().get("hide_offline_devices", False))
+def get_device_order() -> list[str]:
+    """主页卡片的手动顺序（did 列表）；空表示按默认规则排序。"""
+    raw = _read_raw().get("device_order")
+    if not isinstance(raw, list):
+        return []
+    return [str(did) for did in raw if isinstance(did, str) and did]
 
 
-def set_hide_offline_devices(value: bool) -> None:
+def set_device_order(dids: list[str]) -> None:
     raw = _read_raw()
-    raw["hide_offline_devices"] = bool(value)
+    raw["device_order"] = [str(did) for did in dids]
+    _write_raw(raw)
+
+
+def get_scene_order() -> list[str]:
+    """场景卡片的手动顺序（scene_id 列表）；空表示按名称排序。"""
+    raw = _read_raw().get("scene_order")
+    if not isinstance(raw, list):
+        return []
+    return [str(sid) for sid in raw if isinstance(sid, str) and sid]
+
+
+def set_scene_order(scene_ids: list[str]) -> None:
+    raw = _read_raw()
+    raw["scene_order"] = [str(sid) for sid in scene_ids]
+    _write_raw(raw)
+
+
+def get_room_order() -> list[str]:
+    """房间标签的自定义顺序；空列表表示按名称排序。"""
+    raw = _read_raw().get("room_order")
+    if not isinstance(raw, list):
+        return []
+    return [str(name) for name in raw if isinstance(name, str) and name]
+
+
+def set_room_order(rooms: list[str]) -> None:
+    raw = _read_raw()
+    raw["room_order"] = [str(name) for name in rooms]
     _write_raw(raw)
 
 

@@ -1995,6 +1995,7 @@ class _BoardCard(QFrame):
                  parent=None):
         super().__init__(parent)
         self._did = dev.did
+        self._device = dev
         self._board = board
         self._online = dev.online
         self.setObjectName("boardCard")
@@ -2013,7 +2014,6 @@ class _BoardCard(QFrame):
         self._name.setFont(QFont("Microsoft YaHei UI", 9, QFont.Weight.DemiBold))
         # 水平 Ignored：布局可任意压缩标签，长名称不会把列撑宽
         self._name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._name.setText(dev.name)
         self._name.setToolTip(f"{dev.name} · {dev.room_name}")
         self._sub = QLabel()
         self._sub.setFont(QFont("Microsoft YaHei UI", 8))
@@ -2026,6 +2026,7 @@ class _BoardCard(QFrame):
         text_col.addWidget(self._sub)
         lay.addLayout(text_col, stretch=1)
 
+        self._update_elided_name()
         self.retheme()
         self._layout = lay
         self._power_btn = self._make_power_btn(power)
@@ -2054,6 +2055,26 @@ class _BoardCard(QFrame):
             lambda _checked=False, d=self._did, b=btn: self._board._toggle_power(d, b))
         self._layout.addWidget(btn)
         return btn
+
+    def _update_elided_name(self) -> None:
+        """按当前宽度省略设备名，完整名称留在 tooltip。
+
+        挂件卡片宽度随列数变化，名称必须单行省略，否则会被硬裁掉。
+        """
+        # 取标签宽度与卡片剩余宽度的较小值：离屏渲染时标签可能报出
+        # 超出卡片的宽度，直接用会把文字算成放得下
+        room = self.width() - 10 - 8 - 28 - 8
+        width = min(self._name.width(), room)
+        if width <= 0:
+            # 布局还没结算：先放完整名字，等 resize 再截
+            self._name.setText(self._device.name)
+            return
+        self._name.setText(self._name.fontMetrics().elidedText(
+            self._device.name, Qt.TextElideMode.ElideRight, width))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_elided_name()
 
     @staticmethod
     def _sub_text(dev: DeviceInfo, metrics: str | None) -> str:
