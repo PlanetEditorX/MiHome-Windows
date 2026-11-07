@@ -37,42 +37,65 @@ from app.core import settings_store
 
 cfg = settings_store.get_lock_automation()
 assert cfg == {
-    "enabled": False, "did": "",
-    "startup_action": "none",
-    "unlock_action": "on", "lock_action": "off",
+    "enabled": False, "targets": [],
     "time_enabled": False, "time_start": "08:00", "time_end": "23:00",
     "net_enabled": False, "net_names": [],
 }, f"默认配置不符: {cfg}"
 
-settings_store.set_lock_automation(
-    {"enabled": True, "did": "lamp1", "unlock_action": "off", "lock_action": "on"})
-assert settings_store.get_lock_automation() == {
+# 新结构：一条事件可以对多个目标各自指定动作（设备开/关、自动化启用/停用）
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [
+        {"kind": "device", "id": "lamp1", "name": "台灯",
+         "startup": "on", "unlock": "on", "lock": "off"},
+        {"kind": "automation", "id": "sc9", "name": "无人关灯", "home_id": "h1",
+         "startup": "none", "unlock": "off", "lock": "on"},
+    ],
+})
+got = settings_store.get_lock_automation()
+assert [t["id"] for t in got["targets"]] == ["lamp1", "sc9"], got["targets"]
+assert got["targets"][1] == {
+    "kind": "automation", "id": "sc9", "name": "无人关灯", "home_id": "h1",
+    "startup": "none", "unlock": "off", "lock": "on",
+}, got["targets"][1]
+
+# 旧配置（v0.9.1 的单 did + 三个 action）读取时迁移成一条设备目标，
+# 用户升级后原来的「解锁开灯 / 锁屏关灯」照旧生效
+_raw = settings_store._read_raw()
+_raw["lock_automation"] = {
     "enabled": True, "did": "lamp1",
-    "startup_action": "none",
-    "unlock_action": "off", "lock_action": "on",
-    "time_enabled": False, "time_start": "08:00", "time_end": "23:00",
-    "net_enabled": False, "net_names": [],
-}, "存取往返不一致"
+    "startup_action": "on", "unlock_action": "off", "lock_action": "on",
+}
+settings_store._write_raw(_raw)
+legacy = settings_store.get_lock_automation()["targets"]
+assert legacy == [{
+    "kind": "device", "id": "lamp1", "name": "", "home_id": "",
+    "startup": "on", "unlock": "off", "lock": "on",
+}], legacy
 
-# 旧配置（无 startup_action 键）升级后不得凭空多出启动动作
-settings_store.set_lock_automation({"enabled": True, "did": "lamp1"})
-assert settings_store.get_lock_automation()["startup_action"] == "none", \
-    "旧配置未回落「不操作」"
-settings_store.set_lock_automation(
-    {"enabled": True, "did": "lamp1", "startup_action": "on"})
-assert settings_store.get_lock_automation()["startup_action"] == "on", \
-    "启动动作未存取"
+# 用户把目标删光（显式 targets: []）后，绝不能因为旧 did 还在就长回来
+settings_store.set_lock_automation({"enabled": True, "targets": []})
+assert settings_store.get_lock_automation()["targets"] == [], "删光的目标又复活了"
 
-# 非法值一律收敛：did 非字符串按未选择，动作越界回落默认
-settings_store.set_lock_automation(
-    {"enabled": True, "did": 123, "unlock_action": "toggle", "lock_action": None})
-bad = settings_store.get_lock_automation()
-assert bad["did"] == "" and bad["unlock_action"] == "on" and bad["lock_action"] == "off", \
-    f"非法值未收敛: {bad}"
+# 非法目标整条丢弃；重复 (kind,id) 只留第一条；越界动作收敛成 none
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [
+        {"kind": "device", "id": "lamp1", "unlock": "on"},
+        {"kind": "device", "id": "lamp1", "unlock": "off"},
+        {"kind": "robot", "id": "x"},
+        {"kind": "device", "id": 123},
+        {"kind": "automation", "id": "sc1", "unlock": "toggle", "lock": None},
+    ],
+})
+targets = settings_store.get_lock_automation()["targets"]
+assert [t["id"] for t in targets] == ["lamp1", "sc1"], targets
+assert targets[0]["unlock"] == "on", "重复目标未保留第一条"
+assert targets[1]["unlock"] == "none" and targets[1]["lock"] == "none", targets[1]
 
 # 生效时间非法 HH:MM 回落默认；网络名单过滤非字符串/去重/去空白
 settings_store.set_lock_automation({
-    "enabled": True, "did": "lamp1",
+    "enabled": True, "targets": [{"kind": "device", "id": "lamp1"}],
     "time_start": "25:00", "time_end": "bad",
     "net_names": ["ok", "", None, 5, "ok", "  spaced  "],
 })
@@ -81,12 +104,12 @@ assert bad["time_start"] == "08:00" and bad["time_end"] == "23:00", \
     f"非法时刻未收敛: {bad}"
 assert bad["net_names"] == ["ok", "spaced"], f"网络名单未收敛: {bad['net_names']}"
 
-# 非 dict / None 不炸，按默认配置处理
+# 非 dict / None 不炸，按默认配置处理（目标为空）
 settings_store.set_lock_automation("garbage")
 assert settings_store.get_lock_automation()["enabled"] is False
 settings_store.set_lock_automation(None)
-assert settings_store.get_lock_automation()["did"] == ""
-print("1. settings.json 锁屏联动配置存取/收敛 OK")
+assert settings_store.get_lock_automation()["targets"] == []
+print("1. settings.json 锁屏联动配置存取/收敛/旧配置迁移 OK")
 
 # ---------- 1.5 生效条件纯函数（时间窗 / 网络匹配） ----------
 
@@ -201,15 +224,38 @@ class _FakeService:
     def __init__(self, logged_in: bool = True, fail: bool = False):
         self._logged_in = logged_in
         self._fail = fail
+        # 只让某一台设备失败：验证「单个目标失败不拖累其余目标」
+        self.fail_did: str | None = None
         self.calls: list[tuple[str, bool]] = []
+        # 自动化开关调用：(scene_id, enabled, home_id)
+        self.auto_calls: list[tuple[str, bool, str]] = []
 
     def login_status(self) -> bool:
         return self._logged_in
 
     def set_power_state(self, did: str, state: bool) -> None:
-        if self._fail:
+        if self._fail or did == self.fail_did:
             raise RuntimeError("云端拒绝")
         self.calls.append((did, state))
+
+    def set_automation_enabled(self, automation, enable: bool) -> None:
+        if self._fail:
+            raise RuntimeError("云端拒绝")
+        self.auto_calls.append(
+            (automation.scene_id, enable, automation.home_id))
+
+
+def _dev(tid, unlock="on", lock="off", startup="none", name="台灯"):
+    """一条设备目标：默认即「解锁打开、锁屏关闭」。"""
+    return {"kind": "device", "id": tid, "name": name,
+            "startup": startup, "unlock": unlock, "lock": lock}
+
+
+def _auto(tid, unlock="none", lock="on", startup="none",
+          name="无人关灯", home_id="home1"):
+    """一条自动化目标：默认即「锁屏启用」（配合锁屏关灯用）。"""
+    return {"kind": "automation", "id": tid, "name": name, "home_id": home_id,
+            "startup": startup, "unlock": unlock, "lock": lock}
 
 
 def _drain(jobs: _FakeJobs, service: _FakeService) -> None:
@@ -236,7 +282,8 @@ auto.state_applied.connect(lambda d, on: applied.append((d, on)))
 auto.failed.connect(failures.append)
 
 # 3.1 总开关关闭：任何事件都不提交
-settings_store.set_lock_automation({"enabled": False, "did": "lamp1"})
+settings_store.set_lock_automation(
+    {"enabled": False, "targets": [_dev("lamp1")]})
 auto.reload_config()
 stub.unlocked.emit()
 stub.locked.emit()
@@ -244,7 +291,7 @@ assert jobs.tasks == [], "关闭时仍提交了任务"
 
 # 3.2 启用 + 解锁 → 开灯（用户要的核心语义）
 settings_store.set_lock_automation(
-    {"enabled": True, "did": "lamp1", "unlock_action": "on", "lock_action": "off"})
+    {"enabled": True, "targets": [_dev("lamp1")]})
 auto.reload_config()
 stub.unlocked.emit()
 assert len(jobs.tasks) == 1
@@ -262,7 +309,7 @@ assert service.calls[-1] == ("lamp1", False), f"锁屏未关灯: {service.calls}
 
 # 3.4 该方向设为「不操作」时不提交
 settings_store.set_lock_automation(
-    {"enabled": True, "did": "lamp1", "unlock_action": "none", "lock_action": "off"})
+    {"enabled": True, "targets": [_dev("lamp1", unlock="none")]})
 auto.reload_config()
 stub.unlocked.emit()
 assert jobs.tasks == [], "none 方向仍提交了任务"
@@ -271,7 +318,7 @@ assert jobs.tasks == [], "none 方向仍提交了任务"
 # 任务会提交（条件/login 检查都在 fn 里），但不控制、不提示
 service._logged_in = False
 settings_store.set_lock_automation(
-    {"enabled": True, "did": "lamp1", "unlock_action": "on", "lock_action": "off"})
+    {"enabled": True, "targets": [_dev("lamp1")]})
 auto.reload_config()
 applied_before = len(applied)
 failures_before = len(failures)
@@ -288,7 +335,8 @@ applied_before = len(applied)
 stub.unlocked.emit()
 assert len(jobs.tasks) == 1
 _drain(jobs, service)
-assert failures == ["云端拒绝"], f"失败未上报: {failures}"
+assert len(failures) == 1 and "云端拒绝" in failures[0] and \
+    "台灯" in failures[0], f"失败未上报（应含目标名与原因）: {failures}"
 assert len(applied) == applied_before, "失败不应发成功信号"
 # pending 已清理：下一次锁屏事件能再次提交
 service._fail = False
@@ -305,6 +353,104 @@ stub.locked.emit()
 assert len(jobs.tasks) == 1, f"在途事件未去重: {len(jobs.tasks)} 个任务"
 _drain(jobs, service)
 assert service.calls[-1] == ("lamp1", True)
+# 3.16 多目标：解锁「开台灯 + 关挂灯 + 停用无人关灯」，
+#      锁屏「关台灯 + 开挂灯 + 启用无人关灯」——本次需求的核心场景
+auto_applied: list[tuple[str, bool]] = []
+batches: list[list] = []
+auto.automation_applied.connect(
+    lambda sid, on: auto_applied.append((sid, on)))
+auto.batch_applied.connect(batches.append)
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [
+        _dev("lamp1"),
+        _dev("lamp2", unlock="off", lock="on", name="挂灯"),
+        _auto("sc9", unlock="off", lock="on"),
+    ],
+})
+auto.reload_config()
+jobs.tasks.clear()
+service.calls.clear()
+service.auto_calls.clear()
+applied.clear()
+auto_applied.clear()
+batches.clear()
+failures.clear()
+stub.unlocked.emit()
+assert len(jobs.tasks) == 1, "多目标应合并成一个批次任务"
+_drain(jobs, service)
+assert service.calls == [("lamp1", True), ("lamp2", False)], \
+    f"解锁设备动作不符: {service.calls}"
+assert service.auto_calls == [("sc9", False, "home1")], \
+    f"解锁未停用自动化 / home_id 丢失: {service.auto_calls}"
+assert applied == [("lamp1", True), ("lamp2", False)], applied
+assert auto_applied == [("sc9", False)], auto_applied
+assert len(batches) == 1 and len(batches[0]) == 3, \
+    f"批量提示应汇总全部成功项: {batches}"
+assert not failures, f"全成功却报了失败: {failures}"
+
+stub.locked.emit()
+_drain(jobs, service)
+assert service.calls[-2:] == [("lamp1", False), ("lamp2", True)], \
+    f"锁屏设备动作不符: {service.calls}"
+assert service.auto_calls[-1] == ("sc9", True, "home1"), \
+    f"锁屏未启用自动化: {service.auto_calls}"
+assert auto_applied[-1] == ("sc9", True)
+
+# 3.17 一个目标失败不应拖累同一批次里的其余目标
+service.fail_did = "lamp1"
+jobs.tasks.clear()
+service.calls.clear()
+service.auto_calls.clear()
+applied.clear()
+auto_applied.clear()
+batches.clear()
+failures.clear()
+stub.unlocked.emit()
+_drain(jobs, service)
+assert service.calls == [("lamp2", False)], \
+    f"台灯失败后挂灯仍应被控制: {service.calls}"
+assert service.auto_calls == [("sc9", False, "home1")], \
+    f"台灯失败后自动化仍应被控制: {service.auto_calls}"
+assert applied == [("lamp2", False)] and auto_applied == [("sc9", False)]
+assert len(batches) == 1 and len(batches[0]) == 2, \
+    f"批量提示只应含成功项: {batches}"
+assert len(failures) == 1 and "台灯" in failures[0], failures
+service.fail_did = None
+
+# 3.18 启动时同样支持多目标（只对配了 startup 的目标动手）
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [_dev("lamp1", startup="on", unlock="none", lock="none"),
+                _auto("sc9", startup="off", unlock="none", lock="none")],
+})
+auto.reload_config()
+jobs.tasks.clear()
+service.calls.clear()
+service.auto_calls.clear()
+auto.run_startup()
+assert len(jobs.tasks) == 1
+_drain(jobs, service)
+assert service.calls == [("lamp1", True)] and \
+    service.auto_calls == [("sc9", False, "home1")], \
+    f"启动方向多目标不符: {service.calls} {service.auto_calls}"
+
+# 3.19 目标为空 / 三个方向全「不操作」：连任务都不提交
+settings_store.set_lock_automation({"enabled": True, "targets": []})
+auto.reload_config()
+jobs.tasks.clear()
+stub.unlocked.emit()
+stub.locked.emit()
+auto.run_startup()
+assert jobs.tasks == [], "没有目标不该提交空任务"
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [_dev("lamp1", startup="none", unlock="none", lock="none")],
+})
+auto.reload_config()
+stub.unlocked.emit()
+assert jobs.tasks == [], "全为「不操作」不该提交空任务"
+
 print("3. 联动执行（语义/守卫/失败/去重） OK")
 
 # ---------- 3.5+ 生效时间/网络条件门 ----------
@@ -320,8 +466,7 @@ auto.skipped.connect(skipped.append)
 # 3.8 生效时间：构造一个「此刻必定不命中」的跨午夜窗
 # （起点=此刻+1 分钟，终点=此刻-1 分钟 → 窗口在前后两侧，不含现在）
 settings_store.set_lock_automation({
-    "enabled": True, "did": "lamp1",
-    "unlock_action": "on", "lock_action": "off",
+    "enabled": True, "targets": [_dev("lamp1")],
     "time_enabled": True,
     "time_start": (_now + timedelta(minutes=1)).strftime("%H:%M"),
     "time_end": (_now - timedelta(minutes=1)).strftime("%H:%M"),
@@ -339,8 +484,7 @@ assert skipped and "生效时段" in skipped[0], f"跳过原因未上报: {skipp
 _real_net = _la.current_network_names
 try:
     settings_store.set_lock_automation({
-        "enabled": True, "did": "lamp1",
-        "unlock_action": "on", "lock_action": "off",
+        "enabled": True, "targets": [_dev("lamp1")],
         "time_enabled": False,
         "net_enabled": True, "net_names": ["CMCC"],
     })
@@ -395,8 +539,8 @@ try:
 
     # 3.10 启动=打开：主动触发一次开灯（用户要的核心语义）
     settings_store.set_lock_automation({
-        "enabled": True, "did": "lamp1", "startup_action": "on",
-        "unlock_action": "on", "lock_action": "off",
+        "enabled": True,
+        "targets": [_dev("lamp1", startup="on")],
     })
     auto.reload_config()
     jobs.tasks.clear()
@@ -411,7 +555,7 @@ try:
 
     # 3.11 启动=不操作（默认值）：不提交任何任务
     settings_store.set_lock_automation({
-        "enabled": True, "did": "lamp1", "startup_action": "none"})
+        "enabled": True, "targets": [_dev("lamp1", startup="none")]})
     auto.reload_config()
     jobs.tasks.clear()
     auto.run_startup()
@@ -419,7 +563,7 @@ try:
 
     # 3.12 总开关关闭：启动方向同样不该动
     settings_store.set_lock_automation({
-        "enabled": False, "did": "lamp1", "startup_action": "on"})
+        "enabled": False, "targets": [_dev("lamp1", startup="on")]})
     auto.reload_config()
     jobs.tasks.clear()
     auto.run_startup()
@@ -428,8 +572,8 @@ try:
     # 3.13 服务未就绪（未登录）：不算失败、不弹提示，排重试；
     # 就绪后重试那一枪必须真的把灯打开——否则「开机开灯」形同虚设
     settings_store.set_lock_automation({
-        "enabled": True, "did": "lamp1", "startup_action": "on",
-        "unlock_action": "none", "lock_action": "none"})
+        "enabled": True,
+        "targets": [_dev("lamp1", startup="on", unlock="none", lock="none")]})
     auto.reload_config()
     jobs.tasks.clear()
     applied.clear()
@@ -450,7 +594,7 @@ try:
 
     # 3.14 重试途中配置被改成「不操作」：放弃，不补偿动作
     settings_store.set_lock_automation({
-        "enabled": True, "did": "lamp1", "startup_action": "none"})
+        "enabled": True, "targets": [_dev("lamp1", startup="none")]})
     auto.reload_config()
     jobs.tasks.clear()
     auto._retry_startup()

@@ -299,12 +299,16 @@ class MainWindow(QMainWindow):
         self._schedule_timer.setInterval(_SCHEDULE_INTERVAL_MS)
         self._schedule_timer.timeout.connect(self._on_schedule_tick)
 
-        # 锁屏联动：会话锁屏/解锁时按配置自动开关设备（见 core/lock_automation.py）。
-        # 与定时任务并列的常驻自动化：登录完成后启动，设置保存后热更新配置
+        # 锁屏联动：会话锁屏/解锁时按配置自动控制设备与自动化
+        # （见 core/lock_automation.py）。与定时任务并列的常驻自动化：
+        # 登录完成后启动，设置保存后热更新配置
         self._lock_watcher = SessionLockWatcher(self)
         self._lock_automation = LockAutomation(
             self._service, self._jobs, self._lock_watcher, self)
         self._lock_automation.state_applied.connect(self._on_lock_state_applied)
+        self._lock_automation.automation_applied.connect(
+            self._on_lock_automation_applied)
+        self._lock_automation.batch_applied.connect(self._on_lock_batch_applied)
         self._lock_automation.failed.connect(self._on_lock_failed)
         self._lock_automation.skipped.connect(self._on_lock_skipped)
         self._lock_started = False
@@ -1035,16 +1039,41 @@ class MainWindow(QMainWindow):
             Toast.info(
                 self,
                 "新功能「锁屏联动」未开启：解锁电脑自动开灯、锁屏自动关灯，"
-                "可在 设置 → 应用功能 → 锁屏联动 中配置",
+                "还能同时启停米家自动化，可在 设置 → 锁屏联动 中配置",
                 8000)
         except Exception:
             logger.debug("锁屏联动引导提示失败", exc_info=True)
 
     def _on_lock_state_applied(self, did: str, turn_on: bool) -> None:
-        """联动控制成功：复用定时任务的界面回写，并Toast提示。"""
+        """联动控制了设备：复用定时任务的界面回写（卡片 / 托盘 / 挂件）。"""
         self._apply_scheduled_state(did, turn_on)
-        name = next((d.name for d in self._all_devices if d.did == did), did[-6:])
-        Toast.info(self, f"锁屏联动：已{'打开' if turn_on else '关闭'}「{name}」", 3000)
+
+    def _on_lock_automation_applied(self, scene_id: str, enable: bool) -> None:
+        """联动拨动了自动化总开关：同步本地模型与自动化卡片。"""
+        automation = next(
+            (a for a in (self._automations or []) if a.scene_id == scene_id), None)
+        if automation is None:
+            return
+        automation.enabled = enable
+        card = self._automation_cards.get(scene_id)
+        if card is not None and shiboken6.isValid(card):
+            card.set_enabled_state(enable)
+
+    def _on_lock_batch_applied(self, items: list) -> None:
+        """一条锁屏事件可能动了多个目标：合成一条提示，别刷屏。"""
+        parts = []
+        for kind, _tid, name, on in items:
+            if kind == "automation":
+                verb = "启用" if on else "停用"
+            else:
+                verb = "打开" if on else "关闭"
+            parts.append(f"已{verb}「{name}」")
+        if not parts:
+            return
+        shown = "、".join(parts[:3])
+        if len(parts) > 3:
+            shown += f" 等 {len(parts)} 项"
+        Toast.info(self, f"锁屏联动：{shown}", 4000 if len(parts) > 3 else 3000)
 
     def _on_lock_failed(self, message: str) -> None:
         """联动控制失败（设备离线/被移除/凭据失效）：提示但不打断。"""
@@ -1509,6 +1538,29 @@ class MainWindow(QMainWindow):
         dlg.exec()
         dlg.deleteLater()
 
+    def _automations_for_settings(self) -> list:
+        """设置页要拿自动化清单当联动目标；没缓存过就同步拉一次。
+
+        自动化分页是按需加载的，用户从没点过那一页时这里还是 None。
+        设置对话框是模态的，没法等异步回调再填下拉，所以就地取一次
+        （一次请求，通常几百毫秒）；失败返回空列表且不缓存，下次再试。
+        """
+        if self._automations is not None:
+            return self._automations
+        if self._service is None:
+            return []
+        from PySide6.QtGui import QGuiApplication
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            automations = self._service.automation_list()
+        except Exception:
+            logger.debug("设置页预取自动化列表失败", exc_info=True)
+            return []
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+        self._automations = automations
+        return automations
+
     def show_settings(self) -> None:
         """打开设置对话框（托盘菜单与主界面菜单共用入口）。"""
         # 弹出期间置顶已有实例，避免托盘与主界面重复弹出
@@ -1517,7 +1569,9 @@ class MainWindow(QMainWindow):
             dlg.raise_()
             dlg.activateWindow()
             return
-        dlg = SettingsDialog(self, devices=self._all_devices)
+        dlg = SettingsDialog(
+            self, devices=self._all_devices,
+            automations=self._automations_for_settings())
         self._settings_dialog = dlg
         dlg.exec()
         scale_changed = getattr(dlg, "_scale_changed", False)

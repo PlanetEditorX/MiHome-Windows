@@ -39,17 +39,17 @@ _DEFAULTS: dict = {
     "ui_scale": 1.0,    # 界面缩放个人微调乘数（在系统缩放之上再乘），需重启生效
     "tray_columns": 2,  # 托盘快捷窗口卡片列数：1 或 2
     "check_update_enabled": True,  # 启动时自动检查 GitHub 新版本
-    # 锁屏联动：会话锁屏/解锁时自动开关指定设备（见 core/lock_automation.py）。
-    # 默认语义即最常见的用法：解锁开灯、锁屏关灯。
+    # 锁屏联动：会话锁屏/解锁时自动控制一组设备与自动化
+    # （见 core/lock_automation.py）。目标列表里每项自带三个方向的状态：
+    #   {"kind": "device"|"automation", "id": did|scene_id, "name": ...,
+    #    "home_id": 自动化所属家庭, "startup"/"unlock"/"lock": on|off|none}
+    # 默认语义即最常见的用法：解锁开灯、锁屏关灯（由界面新增目标时给出）。
     # time_*：生效时间段（每日，支持跨午夜）；关闭=不限制时段。
     # net_*：生效网络名单（WiFi 名/以太网名，包含匹配）；关闭或名单
     #        为空=不限制网络。两者任一不满足，本次事件跳过并提示。
     "lock_automation": {
         "enabled": False,
-        "did": "",             # 目标设备 did；空串=尚未选择
-        "startup_action": "none",  # 应用启动时做什么：on / off / none
-        "unlock_action": "on",  # 解锁时对该设备做什么：on / off / none
-        "lock_action": "off",   # 锁屏时对该设备做什么：on / off / none
+        "targets": [],
         "time_enabled": False,  # 是否限定生效时间段
         "time_start": "08:00",  # 时段起 HH:MM（含）
         "time_end": "23:00",    # 时段止 HH:MM（不含）；起>止=跨午夜
@@ -348,17 +348,23 @@ def set_check_update_enabled(value: bool) -> None:
     _write_raw(raw)
 
 
-# ---------- 锁屏联动（会话锁屏/解锁时自动控制设备） ----------
+# ---------- 锁屏联动（会话锁屏/解锁时自动控制设备/自动化） ----------
 
 _LOCK_ACTIONS = ("on", "off", "none")
+# 联动目标分两类：设备（开/关）与自动化（启用/停用）。都与云端同一个
+# 「写入一个布尔」的动作同构，所以能放进同一条执行链（见 lock_automation）。
+_LOCK_KINDS = ("device", "automation")
+# 三个触发方向：启动（应用启动后主动跑一次）/ 解锁 / 锁屏
+_LOCK_EVENTS = ("startup", "unlock", "lock")
+# 新目标默认沿用 v0.8.x 的单设备语义：解锁打开、锁屏关闭、启动不操作。
+# 单独抽出来是因为「用户显式写 targets: []」与「旧配置没有 targets 键」
+# 必须区分——前者是「删光了」，后者才需要从 did 迁移。
+_LOCK_TARGET_DEFAULT_ACTIONS = {
+    "startup": "none", "unlock": "on", "lock": "off",
+}
 _LOCK_DEFAULTS = {
     "enabled": False,
-    "did": "",
-    # 应用启动（登录完成）时执行的动作。默认「不操作」：这是 v0.8.4 新增
-    # 的方向，老配置升级后不该凭空多出一个开机动作，由用户显式开启。
-    "startup_action": "none",
-    "unlock_action": "on",
-    "lock_action": "off",
+    "targets": [],
     "time_enabled": False,
     "time_start": "08:00",
     "time_end": "23:00",
@@ -387,29 +393,93 @@ def _normalize_net_names(value) -> list[str]:
     return seen
 
 
+def _normalize_lock_target(raw) -> dict | None:
+    """单个联动目标收敛；无法识别时返回 None（整条丢弃）。
+
+    结构：{kind, id, name, home_id, startup, unlock, lock}
+    - kind 只认 device / automation（缺省按 device 兼容旧字段 did）；
+    - id 是设备 did 或自动化的 scene_id，必须是非空字符串；
+    - home_id 仅自动化需要（拨开关的请求要带家庭），设备留空；
+    - 三个方向各取 on/off/none，缺失或非法一律 none（该方向不动作）。
+    """
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("kind") or "").strip().lower()
+    if kind not in _LOCK_KINDS:
+        # 旧结构只有 did，没有 kind
+        kind = "device" if isinstance(raw.get("did"), str) else ""
+    if kind not in _LOCK_KINDS:
+        return None
+    tid = raw.get("id")
+    if not isinstance(tid, str):
+        tid = raw.get("did") if isinstance(raw.get("did"), str) else ""
+    tid = tid.strip()
+    if not tid:
+        return None
+    target = {
+        "kind": kind,
+        "id": tid,
+        # 名称只用于提示文案（"已打开「台灯」"），云端改名后下次打开
+        # 设置页会按 id 重新取到新名字，所以这里存旧名不影响功能
+        "name": str(raw.get("name") or "").strip()[:64],
+        "home_id": str(raw.get("home_id") or "").strip()
+        if kind == "automation" else "",
+    }
+    for event in _LOCK_EVENTS:
+        value = raw.get(event, _LOCK_TARGET_DEFAULT_ACTIONS[event])
+        target[event] = value if value in _LOCK_ACTIONS else "none"
+    return target
+
+
+def _normalize_lock_targets(raw: dict) -> list[dict]:
+    """目标列表收敛 + 去重（同 kind 同 id 只保留第一条）。
+
+    旧配置（v0.9.1 及以前）存的是单个 did + 三个 action。只有在
+    「压根没有 targets 键」时才迁移，用户把目标删光后写下的 [] 必须
+    保持为空，否则删了又自动长回来。
+    """
+    items = raw.get("targets")
+    if not isinstance(items, (list, tuple)):
+        items = []
+        if "targets" not in raw:
+            legacy = _normalize_lock_target({
+                "kind": "device",
+                "id": raw.get("did"),
+                "startup": raw.get("startup_action",
+                                   _LOCK_TARGET_DEFAULT_ACTIONS["startup"]),
+                "unlock": raw.get("unlock_action",
+                                  _LOCK_TARGET_DEFAULT_ACTIONS["unlock"]),
+                "lock": raw.get("lock_action",
+                                _LOCK_TARGET_DEFAULT_ACTIONS["lock"]),
+            })
+            if legacy is not None:
+                items = [legacy]
+    targets: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        target = _normalize_lock_target(item)
+        if target is None:
+            continue
+        key = (target["kind"], target["id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
+    return targets
+
+
 def _normalize_lock_automation(raw) -> dict:
     """把磁盘/界面传入的配置收敛成合法结构；非法字段回落默认值。
 
-    动作只认 on / off / none（none=该方向不动作，例如只想关不想开）；
-    did 必须是字符串（设备 id），其余类型一律按未选择处理；
+    targets 是「每个目标各自持有三个方向状态」的列表，取代 v0.9.1 的
+    单设备 did + unlock_action/lock_action/startup_action（读取时自动迁移）。
     生效时间两端必须是合法 HH:MM；生效网络名单过滤非字符串并去重。
     """
     if not isinstance(raw, dict):
         raw = {}
-    did = raw.get("did")
-    if not isinstance(did, str):
-        did = ""
-    unlock = raw.get("unlock_action")
-    lock = raw.get("lock_action")
-    startup = raw.get("startup_action")
     return {
         "enabled": bool(raw.get("enabled", _LOCK_DEFAULTS["enabled"])),
-        "did": did,
-        # 旧配置没有 startup_action 键：回落默认（不操作），不影响老用户
-        "startup_action": (startup if startup in _LOCK_ACTIONS
-                           else _LOCK_DEFAULTS["startup_action"]),
-        "unlock_action": unlock if unlock in _LOCK_ACTIONS else _LOCK_DEFAULTS["unlock_action"],
-        "lock_action": lock if lock in _LOCK_ACTIONS else _LOCK_DEFAULTS["lock_action"],
+        "targets": _normalize_lock_targets(raw),
         "time_enabled": bool(raw.get("time_enabled", _LOCK_DEFAULTS["time_enabled"])),
         "time_start": _normalize_hhmm(raw.get("time_start"), _LOCK_DEFAULTS["time_start"]),
         "time_end": _normalize_hhmm(raw.get("time_end"), _LOCK_DEFAULTS["time_end"]),

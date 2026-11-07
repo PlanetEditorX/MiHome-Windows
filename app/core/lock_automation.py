@@ -1,29 +1,40 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # MiHome-Windows: 米家设备的 Windows 桌面控制端
 # Copyright (C) 2026 MiHome-Windows contributors
-"""锁屏联动：锁屏 / 解锁时自动控制指定设备的开关。
+"""锁屏联动：锁屏 / 解锁 / 启动时，按配置控制一组设备与自动化。
 
 典型配置（也是默认语义）：**解锁 → 开灯，锁屏 → 关灯**。
 用户带着电脑离开时锁屏即关灯，回来解锁即亮灯，无需任何手动操作。
 
-此外还有第三个方向「**启动时**」（`startup_action`，默认不操作）：
-应用随系统自启动后主动执行一次动作，用来覆盖「开机时灯是灭的」这种
-冷启动场景——此时既没有解锁事件（本来就没锁），也没有人手动触发。
-它由主窗口在登录完成后显式调用 `run_startup()`，不走会话事件。
+v0.9.2 起目标从「一台设备」升级为**一组目标**，每个目标各自持有三个
+方向的状态，因此一条事件可以同时做多件事，例如：
+
+    解锁 → 打开台灯、停用「无人自动关灯」
+    锁屏 → 关闭台灯、启用「无人自动关灯」
+
+目标分两类，但执行链同构（都是往云端写一个布尔值）：
+- `device`：开 / 关（service.set_power_state）
+- `automation`：启用 / 停用（service.set_automation_enabled）
+
+此外还有第三个方向「**启动时**」（默认不操作）：应用随系统自启动后
+主动执行一次，用来覆盖「开机时灯是灭的」这种冷启动场景——此时既没有
+解锁事件（本来就没锁），也没有人手动触发。由主窗口在登录完成后显式
+调用 `run_startup()`，不走会话事件。
 
 执行链与定时开关完全同构：状态变化只提交一个任务进 JobExecutor
-串行队列（PRIORITY_CONTROL，插队执行），网络调用不占界面线程；
-成功后经 state_applied 信号回主线程同步三处界面（卡片 / 托盘 /
-桌面挂件），失败经 failed 信号提示，与「定时任务」的用户体验一致。
+串行队列（PRIORITY_CONTROL，插队执行），网络调用不占界面线程。
+一个批次内的多个目标**串行执行、单个失败不影响其余**，最后统一回传：
+成功的经 state_applied / automation_applied 通知界面同步，失败的汇总
+成一条 failed 说明。
 
 防抖与守卫：
 - `_pending` 单飞行标志：解锁后 2 秒内又锁屏，只执行最后一次动作，
   不会把队列塞满（米家云端对高频写入会限流）；
 - 未登录（凭据失效）时静默跳过，登录流程由主窗口负责；
-- 配置关闭 / 未选设备 / 该方向设为「不操作」时直接跳过；
+- 配置关闭 / 该方向全部为「不操作」时直接跳过；
 - 生效时间段 / 生效网络条件（见 core/lock_conditions.py）在**任务线程**
   内判定：网络查询是同步子进程（最长 5s），放在这里不会冻结界面；
-  条件不满足发 skipped 信号提示原因，不消耗设备控制。
+  条件不满足发 skipped 信号提示原因，不消耗任何控制。
 - 「启动时」动作带重试：随系统自启时 Wi-Fi 常未连上、令牌还在刷新，
   第一次几乎必然落空，见 _STARTUP_RETRY_MS。
 """
@@ -46,20 +57,38 @@ logger = logging.getLogger(__name__)
 _STARTUP_RETRY_MS = 20_000
 _STARTUP_MAX_TRIES = 9
 
+# 一个批次里最多处理多少个目标：用户手滑配了几十条时，锁屏瞬间会连续
+# 打几十个云端写请求，既慢又容易触发限流。超过的截断并记日志。
+_MAX_TARGETS = 20
+
+
+def _target_name(target: dict) -> str:
+    """目标显示名：优先用配置里存的名称，缺失时退化成 id 尾号。"""
+    name = str(target.get("name") or "").strip()
+    if name:
+        return name
+    tid = str(target.get("id") or "")
+    return f"…{tid[-6:]}" if len(tid) > 6 else (tid or "未命名目标")
+
 
 class LockAutomation(QObject):
-    """把会话锁屏事件翻译成一次设备开关控制。
+    """把会话锁屏事件翻译成一批设备/自动化控制。
 
     用法:
         automation = LockAutomation(service, jobs, watcher)
         automation.state_applied.connect(main._apply_scheduled_state)
+        automation.automation_applied.connect(main._on_lock_automation_applied)
         automation.failed.connect(lambda msg: Toast.info(main, msg, 5000))
         automation.skipped.connect(lambda msg: Toast.info(main, msg, 4000))
         # 登录完成后调用；设置对话框保存后调用 reload_config()
     """
 
-    # (did, turn_on)：控制成功，供界面同步卡片 / 托盘 / 挂件
+    # (did, turn_on)：设备控制成功，供界面同步卡片 / 托盘 / 挂件
     state_applied = Signal(str, bool)
+    # (scene_id, enabled)：自动化开关已拨动，供界面同步自动化卡片
+    automation_applied = Signal(str, bool)
+    # [(kind, id, name, on)]：整批成功项，供界面一次提示（不逐项刷 Toast）
+    batch_applied = Signal(list)
     # 失败信息（用户可读），由界面层决定如何提示
     failed = Signal(str)
     # 条件未满足被跳过的原因（用户可读）；登录态缺失等静默跳过不发
@@ -70,7 +99,7 @@ class LockAutomation(QObject):
         self._service = service
         self._jobs = jobs
         self._watcher = watcher
-        # 单飞行：一次控制在途时忽略后续事件（下一次状态变化再执行）
+        # 单飞行：一次控制批次在途时忽略后续事件（下一次状态变化再执行）
         self._pending = False
         # 「启动时」已重试次数（每次 run_startup 重置）
         self._startup_tries = 0
@@ -110,46 +139,87 @@ class LockAutomation(QObject):
         cfg = self._config
         if not cfg.get("enabled"):
             return
-        action = str(cfg.get("startup_action") or "none")
-        if action not in ("on", "off"):
+        entries = self._entries("startup", cfg)
+        if not entries:
             return
         self._startup_tries = 0
-        self._dispatch(action, "启动", retry=True)
+        self._dispatch(entries, "启动", retry=True)
 
     def _run(self, event: str) -> None:
-        """event: "lock" | "unlock"；按配置决定是否控制设备。"""
+        """event: "lock" | "unlock"；按配置挑出该方向要动的目标。"""
         cfg = self._config
         if not cfg.get("enabled"):
             return
-        action = str(cfg.get(f"{event}_action") or "none")
-        self._dispatch(action, "锁屏" if event == "lock" else "解锁")
+        entries = self._entries(event, cfg)
+        if not entries:
+            return
+        self._dispatch(entries, "锁屏" if event == "lock" else "解锁")
 
-    def _dispatch(self, action: str, label: str, retry: bool = False) -> None:
-        """按 action 控制设备；label 只用于日志文案。
+    def _entries(self, event: str, cfg: dict) -> list[tuple[dict, bool]]:
+        """取出该事件真正要执行的目标：[(target, turn_on)]。
+
+        「不操作」的目标在提交任务前就过滤掉——空批次连任务都不该提交，
+        否则每次锁屏都白占一个队列位置。
+        """
+        targets = cfg.get("targets") or []
+        if len(targets) > _MAX_TARGETS:
+            logger.warning("锁屏联动目标过多（%d 个），只执行前 %d 个",
+                           len(targets), _MAX_TARGETS)
+            targets = targets[:_MAX_TARGETS]
+        entries: list[tuple[dict, bool]] = []
+        for target in targets:
+            action = str(target.get(event) or "none")
+            if action in ("on", "off"):
+                entries.append((target, action == "on"))
+        return entries
+
+    # ---------- 执行 ----------
+
+    def _apply_target(self, target: dict, turn_on: bool) -> None:
+        """把单个目标写成目标状态；失败抛异常由调用方收集。"""
+        kind = target.get("kind")
+        tid = str(target.get("id") or "")
+        if kind == "automation":
+            from app.core.models import AutomationInfo
+            self._service.set_automation_enabled(
+                AutomationInfo(
+                    scene_id=tid,
+                    name=_target_name(target),
+                    home_id=str(target.get("home_id") or ""),
+                ),
+                turn_on,
+            )
+            return
+        self._service.set_power_state(tid, turn_on)
+
+    def _dispatch(
+            self, entries: list[tuple[dict, bool]], label: str,
+            retry: bool = False) -> None:
+        """执行一批目标；label 只用于日志文案。
 
         retry=True 表示这是「启动时」路径：服务未就绪（未登录 / 令牌还在
         刷新）不报错而是排重试；失败也不弹提示，交由重试兜到成功为止。
         """
         cfg = self._config
-        did = str(cfg.get("did") or "")
-        if not did or action not in ("on", "off"):
-            return
         if self._pending:
-            logger.info("锁屏联控制在途，跳过本次%s事件", label)
+            logger.info("锁屏联动控制在途，跳过本次%s事件", label)
             if retry:
                 # 开机瞬间可能正好撞上一条在途控制：不能把这一枪算作
                 # 已尝试，否则竞争会把重试预算白白耗光
                 QTimer.singleShot(_STARTUP_RETRY_MS, self, self._retry_startup)
             return
-        turn_on = action == "on"
-        logger.info("锁屏联动：%s → %s「%s」", label,
-                    "打开" if turn_on else "关闭", did)
+        logger.info("锁屏联动：%s → %s", label, "、".join(
+            f"{'打开' if on else '关闭'}「{_target_name(t)}」"
+            for t, on in entries))
         self._pending = True
 
-        def _work(d=did, on=turn_on, c=cfg):
+        def _work(items=tuple(entries), c=cfg):
             # 条件门在任务线程执行：网络查询是同步子进程（最长 5s），
             # 放主线程会冻结界面；时间判断虽轻也一并放这里统一处理。
-            # 返回 (kind, reason)：done=已控制 / skip=跳过 / retry=服务未就绪。
+            # 返回 (kind, payload)：
+            #   done  → payload=(成功列表, 失败列表)
+            #   skip  → payload=原因文案
+            #   retry → payload=None（服务未就绪，交给启动重试）
             if c.get("time_enabled") and not in_time_window(
                     c.get("time_start"), c.get("time_end")):
                 return ("skip", f"不在生效时段"
@@ -167,25 +237,50 @@ class LockAutomation(QObject):
                     return ("retry" if retry else "skip", None)
             except Exception:
                 return ("retry" if retry else "skip", None)
-            self._service.set_power_state(d, on)
-            return ("done", None)
+            done: list[tuple[dict, bool]] = []
+            errors: list[tuple[dict, str]] = []
+            for target, on in items:
+                try:
+                    self._apply_target(target, on)
+                except Exception as exc:  # noqa: BLE001 - 单项失败不拖累整批
+                    logger.warning("锁屏联动目标失败 %s/%s: %s",
+                                   target.get("kind"), target.get("id"), exc)
+                    errors.append((target, str(exc) or exc.__class__.__name__))
+                else:
+                    done.append((target, on))
+            return ("done", (done, errors))
 
-        def _on_success(result, d=did, on=turn_on):
+        def _on_success(result):
             self._pending = False
-            kind, reason = result if isinstance(result, tuple) else ("done", None)
+            kind, payload = result if isinstance(result, tuple) else ("done", ([], []))
             if kind == "retry":
                 self._schedule_startup_retry()
                 return
             if kind == "skip":
-                if reason:
-                    logger.info("锁屏联动跳过：%s", reason)
-                    self.skipped.emit(reason)
+                if payload:
+                    logger.info("锁屏联动跳过：%s", payload)
+                    self.skipped.emit(payload)
                 return
-            self.state_applied.emit(d, on)
+            done, errors = payload
+            for target, on in done:
+                if target.get("kind") == "automation":
+                    self.automation_applied.emit(str(target.get("id") or ""), on)
+                else:
+                    self.state_applied.emit(str(target.get("id") or ""), on)
+            if done:
+                # 一条事件动了多个目标时逐项弹 Toast 会瞬间叠满屏幕，
+                # 这里合成一条（界面层决定怎么排版）
+                self.batch_applied.emit([
+                    (target.get("kind"), str(target.get("id") or ""),
+                     _target_name(target), on)
+                    for target, on in done
+                ])
+            if errors:
+                self.failed.emit(_failure_text(errors))
 
-        def _on_error(error, d=did, on=turn_on):
+        def _on_error(error):
             self._pending = False
-            logger.warning("锁屏联动执行失败 did=%s on=%s: %s", d, on, error)
+            logger.warning("锁屏联动执行失败: %s", error)
             if retry:
                 # 开机早期的失败大多也是网络问题的变体，先重试；
                 # 重试预算耗尽时会发一次 skipped 说明，不静默吞掉
@@ -219,8 +314,24 @@ class LockAutomation(QObject):
     def _retry_startup(self) -> None:
         """到点重试一次启动动作；配置已被改动则放弃。"""
         cfg = self._config
-        action = str(cfg.get("startup_action") or "none")
-        if not cfg.get("enabled") or action not in ("on", "off"):
+        if not cfg.get("enabled"):
             logger.info("启动联动配置已变更，停止重试")
             return
-        self._dispatch(action, "启动", retry=True)
+        entries = self._entries("startup", cfg)
+        if not entries:
+            logger.info("启动联动配置已变更，停止重试")
+            return
+        self._dispatch(entries, "启动", retry=True)
+
+
+def _failure_text(errors: list[tuple[dict, str]]) -> str:
+    """把失败目标汇总成一句用户能看懂的话。
+
+    单个失败说清是谁 + 原因；多个失败只列名字与首条原因——米家同一次
+    网络故障会让每个目标报同一句话，重复 5 遍没人看。
+    """
+    names = "、".join(f"「{_target_name(t)}」" for t, _ in errors)
+    reason = errors[0][1]
+    if len(errors) == 1:
+        return f"{names}未成功：{reason}"
+    return f"{len(errors)} 个目标未成功：{names}（{reason}）"

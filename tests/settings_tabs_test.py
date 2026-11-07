@@ -3,11 +3,13 @@
 
 锁屏联动从「应用功能」页拆出单独成页，这里锁死拆分后的结构：
 1. 三个分类 tab（主题界面 / 应用功能 / 锁屏联动）；
-2. 锁屏的 8 张卡片归属锁屏页，应用功能页不再含它们；
+2. 锁屏的 6 张卡片（含动态联动目标卡片）归属锁屏页；
 3. 切页只显示当前页（多页叠放不能漏 hide，否则会出现重叠鬼影）；
 4. 三页内容高度都在一屏内（拆分的目的就是这个，退化要能发现）；
 5. 跨页保存路径不变：改锁屏配置后保存仍写回 settings.json；
-6. 换肤后三页都在，且当前页仍是锁屏页（不能把 tab 状态打回第一页）。
+6. 换肤后三页都在，且当前页仍是锁屏页（不能把 tab 状态打回第一页）；
+7. 联动目标行：多目标/混合类型/独立动作/增删/保存；
+8. 自动化列表未加载时，已配置目标保存后不丢失。
 """
 import os
 
@@ -31,10 +33,8 @@ from app.ui.theme_service import apply_theme  # noqa: E402
 settings_store.set_autostart = lambda value: None
 apply_theme("dark")
 
-LOCK_ITEMS = ("_lock_item", "_lock_device_item", "_lock_startup_item",
-              "_lock_unlock_item",
-              "_lock_lock_item", "_lock_time_item", "_lock_span_item",
-              "_lock_net_item", "_lock_netname_item")
+LOCK_ITEMS = ("_lock_item", "_lock_targets_card", "_lock_time_item",
+              "_lock_span_item", "_lock_net_item", "_lock_netname_item")
 FEATURE_ITEMS = ("_autostart_item", "_speaker_item", "_tray_item",
                  "_start_min_item", "_board_item", "_hide_item",
                  "_update_item")
@@ -104,11 +104,11 @@ for name in FEATURE_ITEMS:
     card = getattr(dlg, name)
     assert card in feature_cards, f"{name} 不在应用功能页"
     assert card not in lock_cards, f"{name} 误入锁屏页"
-assert len(lock_cards) == 9, f"锁屏页卡片数 {len(lock_cards)}"
+assert len(lock_cards) == 6, f"锁屏页卡片数 {len(lock_cards)}"
 assert len(feature_cards) == 8, f"应用功能页卡片数 {len(feature_cards)}"
 # 控件本身必须真的挂在锁屏滚动区下（换页不会把它留在旧页里）
 assert lock_page in ancestor_chain(dlg._lock_time_start), "时间字段未挂在锁屏页"
-print("2. 卡片归属（锁屏 9 / 应用功能 8）OK")
+print("2. 卡片归属（锁屏 6 / 应用功能 8）OK")
 
 # ---------- 3. 切页可见性：只有当前页可见 ----------
 pages = (dlg._appearance_scroll, features_page, lock_page)
@@ -138,7 +138,10 @@ print("4. 三页内容均不超过一屏 OK")
 
 # ---------- 5. 跨页保存：改锁屏配置后仍写回 ----------
 settings_store.set_lock_automation({
-    "enabled": True, "did": "lamp1", "time_enabled": True,
+    "enabled": True,
+    "targets": [{"kind": "device", "id": "d0", "name": "Yeelight 显示器挂灯",
+                 "unlock": "on", "lock": "off"}],
+    "time_enabled": True,
     "time_start": "08:00", "time_end": "23:00"})
 dlg2 = SettingsDialog(parent, [])
 dlg2._switch_tab(_TAB_LOCK)
@@ -173,5 +176,97 @@ dlg.deleteLater()
 dlg2.deleteLater()
 dlg3.deleteLater()
 print("6. 换肤后 tab 状态保持 OK")
+
+# ---------- 7. 联动目标行：多目标、混合类型、独立动作、增删与保存 ----------
+from app.core.models import AutomationInfo  # noqa: E402
+from app.ui.settings_dialog import LockTargetRow  # noqa: E402
+
+AUTOMATIONS = [
+    AutomationInfo("sc1", "无人关灯", "home1", "家", True, "挂灯关"),
+    AutomationInfo("sc2", "夜间回家开灯", "home1", "家", False, "开灯"),
+]
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [
+        {"kind": "device", "id": "d0", "name": "Yeelight 显示器挂灯",
+         "startup": "none", "unlock": "on", "lock": "off"},
+        {"kind": "automation", "id": "sc1", "name": "无人关灯",
+         "home_id": "home1", "startup": "none", "unlock": "off", "lock": "on"},
+    ],
+})
+dlg4 = SettingsDialog(parent, DEMO_DEVICES, AUTOMATIONS)
+dlg4._switch_tab(_TAB_LOCK)
+app.processEvents()
+assert len(dlg4._lock_rows) == 2, "已配置的目标未生成两行"
+
+# 设备行动作是「打开/关闭」，自动化行是「启用/停用」，且各自状态独立
+dev_row, auto_row = dlg4._lock_rows
+assert dev_row._actions["unlock"].currentText() == "打开"
+assert auto_row._actions["unlock"].currentText() == "停用"
+assert auto_row._actions["lock"].currentText() == "启用"
+assert dev_row.value()["home_id"] == ""
+assert auto_row.value()["home_id"] == "home1", \
+    "自动化的 home_id 丢了，云端拨开关会失败"
+assert auto_row.value()["unlock"] == "off" and dev_row.value()["unlock"] == "on"
+
+def _select_label(row, label: str) -> None:
+    """按可见文案选目标（下拉按名称排序，索引不等于设备顺序）。"""
+    index = row._combo.findText(label)
+    assert index >= 0, f"下拉里找不到「{label}」"
+    row._combo.setCurrentIndex(index)
+
+
+# 换目标类型时动作下拉文案跟着换、值不丢
+_select_label(dev_row, "自动化·无人关灯")
+assert dev_row._actions["unlock"].currentText() == "启用", \
+    "设备换成自动化后动作文案没跟着变"
+assert dev_row._actions["unlock"].currentIndex() == 0, \
+    "换目标类型把已选动作打乱了"
+_select_label(dev_row, "Yeelight 显示器挂灯（书房）")  # 换回台灯
+
+# 新增一行、选一个目标、设置三个方向
+dlg4._add_lock_row()
+assert len(dlg4._lock_rows) == 3
+new_row = dlg4._lock_rows[-1]
+assert new_row.value() is None, "未选目标的空行不该写进配置"
+_select_label(new_row, "米家台灯 Pro（卧室）")
+new_row._actions["startup"].setCurrentIndex(0)   # 打开
+new_row._actions["unlock"].setCurrentIndex(2)    # 不操作
+new_row._actions["lock"].setCurrentIndex(1)      # 关闭
+assert new_row.value()["id"] == "d1"
+
+# 删掉中间那行自动化
+dlg4._remove_lock_row(auto_row)
+assert len(dlg4._lock_rows) == 2
+
+dlg4._save_and_accept()
+cfg = settings_store.get_lock_automation()
+assert len(cfg["targets"]) == 2, cfg["targets"]
+assert cfg["targets"][0]["id"] == "d0"
+assert cfg["targets"][1] == {
+    "kind": "device", "id": "d1", "name": "米家台灯 Pro", "home_id": "",
+    "startup": "on", "unlock": "none", "lock": "off",
+}, cfg["targets"][1]
+dlg4.deleteLater()
+print("7. 联动目标行（多目标/混合类型/独立动作/增删/保存）OK")
+
+# ---------- 8. 自动化列表未加载时，已配置目标不能被保存抹掉 ----------
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [{"kind": "automation", "id": "scX", "name": "旧自动化",
+                 "home_id": "homeX", "unlock": "off", "lock": "on"}],
+})
+dlg5 = SettingsDialog(parent, DEMO_DEVICES, [])
+dlg5._switch_tab(_TAB_LOCK)
+app.processEvents()
+assert len(dlg5._lock_rows) == 1
+assert "未在列表" in dlg5._lock_rows[0]._combo.currentText()
+assert dlg5._lock_rows[0].value()["home_id"] == "homeX"
+dlg5._save_and_accept()
+cfg = settings_store.get_lock_automation()
+assert len(cfg["targets"]) == 1 and cfg["targets"][0]["id"] == "scX", \
+    f"打开设置点保存把未加载的自动化目标抹掉了: {cfg['targets']}"
+dlg5.deleteLater()
+print("8. 未加载的目标保存后不丢失 OK")
 
 print("\n设置页分类测试全部通过")

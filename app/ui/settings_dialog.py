@@ -7,12 +7,12 @@
 tab 切换分类，内容区切页时做整体淡入过渡（与主页切换房间同款），避免
 直接替换带来的生硬变化。
 
-锁屏联动单独成页而非并入「应用功能」：它带 7 个从属参数（设备、两个
-动作、生效时间/时段、生效网络/网络名），占那一页近一半高度，混在开关
-列表里会让整页滚到两屏。拆开后两页都刚好一屏内，找起来也更直接。
+锁屏联动单独成页而非并入「应用功能」：它带一组可增删的联动目标
+（每个目标在启动/解锁/锁屏三个方向各有动作）加生效时间/时段、生效网络/
+网络名，混在开关列表里会让整页滚到两屏。拆开后两页都刚好一屏内。
 """
 
-from PySide6.QtCore import QEvent, QPropertyAnimation, QSize, Qt, QTime
+from PySide6.QtCore import QEvent, QPropertyAnimation, QSize, Qt, QTime, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QColorDialog,
@@ -76,9 +76,7 @@ _TAB_TITLES = ("主题界面", "应用功能", "锁屏联动")
 # 切页淡入时长：与主页房间切换同款
 _FADE_MS = 160
 
-# 锁屏联动：动作下拉文案 <-> 设置值（none=该方向不动作）
-_LOCK_ACTION_LABELS = {"on": "打开", "off": "关闭", "none": "不操作"}
-_LOCK_LABEL_TO_ACTION = {v: k for k, v in _LOCK_ACTION_LABELS.items()}
+# 锁屏联动：三个触发方向的列名（与 LockTargetRow 的动作下拉一一对应）
 
 
 def _parse_qtime(text: str) -> QTime:
@@ -93,6 +91,191 @@ def _sync_switch(switch) -> None:
     """siui 开关进度同步：setChecked 后须手动对齐动画内部 current。"""
     switch.progress = 1 if switch.isChecked() else 0
     switch.progress_ani.fromProperty()
+
+
+# 联动目标行的列宽/行高：三个动作列等宽，删除按钮固定窄条，
+# 目标下拉吃掉剩余宽度（设备名 + 房间名可能很长）
+_LOCK_ACTION_WIDTH = 74
+_LOCK_ACTION_HEIGHT = 30
+_LOCK_TARGET_PLACEHOLDER = "请选择设备或自动化"
+
+# 两个方向上的动作文案：设备是开/关，自动化是启用/停用，
+# 但内部值都是 on/off/none（同一条执行链）
+_LOCK_ACTION_TEXT = {
+    "device": {"on": "打开", "off": "关闭", "none": "不操作"},
+    "automation": {"on": "启用", "off": "停用", "none": "不操作"},
+}
+_LOCK_ACTION_ORDER = ("on", "off", "none")
+
+
+class LockTargetRow(QWidget):
+    """一行联动目标：目标下拉 + 三个方向的动作下拉 + 移除按钮。
+
+    options 是 [(kind, id, name, home_id, label)]，target 是配置里的一条。
+    动作下拉的文案随目标类型切换（设备「打开/关闭」、自动化「启用/停用」），
+    但选项顺序固定为 on/off/none，所以换类型不会把已选状态打乱。
+
+    已配置的目标若不在当前列表里（设备被移除、自动化列表这次没拉到），
+    仍然会作为一个「未在列表」的选项摆出来——否则用户只是打开设置点了
+    保存，这条配置就被静默抹掉了。
+    """
+
+    removed = Signal(object)
+
+    def __init__(self, options, target=None, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        target = target or {}
+        # _keys 与下拉索引一一对应；首项是占位（未选择）
+        self._keys: list[tuple[str, str, str, str]] = [("", "", "", "")]
+        labels = [_LOCK_TARGET_PLACEHOLDER]
+        for kind, tid, name, home_id, label in options:
+            self._keys.append((kind, tid, name, home_id))
+            labels.append(label)
+        current = 0
+        if target.get("id"):
+            for index, (kind, tid, *_rest) in enumerate(self._keys):
+                if tid and kind == target.get("kind") and tid == target.get("id"):
+                    current = index
+                    break
+            else:
+                self._keys.append((
+                    str(target.get("kind") or ""), str(target.get("id") or ""),
+                    str(target.get("name") or ""),
+                    str(target.get("home_id") or "")))
+                labels.append(f"{target.get('name') or target.get('id')}（未在列表）")
+                current = len(self._keys) - 1
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        self._combo = themed_combo(labels, current=labels[current])
+        self._combo.setFixedHeight(_LOCK_ACTION_HEIGHT)
+        # themed_combo 默认锁死 112px 固定宽度：设备名 + 房间名、尤其是
+        # 米家自动化那种长名字会被裁成半截，还会把右侧三列挤散。
+        # 这里放开上限，让 stretch 把剩余宽度都给目标列。
+        self._combo.setMinimumWidth(180)
+        self._combo.setMaximumWidth(16777215)
+        self._combo.currentIndexChanged.connect(self._on_target_changed)
+        # 米家自动化名常是一整句话，下拉里放不下；完整名走 tooltip
+        for index, text in enumerate(labels):
+            self._combo.setItemData(index, text, Qt.ItemDataRole.ToolTipRole)
+        self._combo.setToolTip(labels[current])
+        lay.addWidget(self._combo, stretch=1)
+
+        self._actions: dict[str, object] = {}
+        for event in ("startup", "unlock", "lock"):
+            combo = themed_combo([], current="")
+            combo.setFixedWidth(_LOCK_ACTION_WIDTH)
+            combo.setFixedHeight(_LOCK_ACTION_HEIGHT)
+            self._actions[event] = combo
+            lay.addWidget(combo)
+
+        self._remove_btn = QPushButton()
+        self._remove_btn.setFixedSize(24, 24)
+        self._remove_btn.setFlat(True)
+        self._remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._remove_btn.setToolTip("移除这个联动目标")
+        self._remove_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; }")
+        self._remove_btn.clicked.connect(lambda: self.removed.emit(self))
+        lay.addWidget(self._remove_btn)
+
+        self._combo.blockSignals(True)
+        self._combo.setCurrentIndex(current)
+        self._combo.blockSignals(False)
+        self._fill_actions({
+            event: str(target.get(event)
+                        or ("on" if event == "unlock" else
+                            "off" if event == "lock" else "none"))
+            for event in ("startup", "unlock", "lock")
+        })
+        self._apply_theme()
+        self._sync_action_enabled()
+
+    # ---------- 数据 ----------
+
+    @property
+    def selected(self) -> tuple[str, str]:
+        """(kind, id)；未选择时均为空串。"""
+        index = self._combo.currentIndex()
+        if 0 <= index < len(self._keys):
+            kind, tid, *_rest = self._keys[index]
+            return kind, tid
+        return "", ""
+
+    def value(self) -> dict | None:
+        """导出配置条目；没选目标时返回 None（保存时被忽略）。"""
+        index = self._combo.currentIndex()
+        if not (0 <= index < len(self._keys)):
+            return None
+        kind, tid, name, home_id = self._keys[index]
+        if not kind or not tid:
+            return None
+        return {
+            "kind": kind,
+            "id": tid,
+            "name": name,
+            "home_id": home_id,
+            "startup": self._action_value("startup"),
+            "unlock": self._action_value("unlock"),
+            "lock": self._action_value("lock"),
+        }
+
+    def _action_value(self, event: str) -> str:
+        combo = self._actions[event]
+        index = combo.currentIndex()
+        if 0 <= index < len(_LOCK_ACTION_ORDER):
+            return _LOCK_ACTION_ORDER[index]
+        return "none"
+
+    # ---------- 交互 ----------
+
+    def _on_target_changed(self) -> None:
+        self._combo.setToolTip(self._combo.currentText())
+        self._fill_actions(None)
+        self._sync_action_enabled()
+
+    def _fill_actions(self, values: dict | None) -> None:
+        """按目标类型重写三个动作下拉的文案，尽量保留原选择。"""
+        kind, _tid = self.selected
+        texts = _LOCK_ACTION_TEXT.get(kind or "device", _LOCK_ACTION_TEXT["device"])
+        for event, combo in self._actions.items():
+            keep = values[event] if values else self._action_value(event)
+            if keep not in _LOCK_ACTION_ORDER:
+                keep = "none"
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems([texts[a] for a in _LOCK_ACTION_ORDER])
+            combo.setCurrentIndex(_LOCK_ACTION_ORDER.index(keep))
+            combo.blockSignals(False)
+
+    def _sync_action_enabled(self) -> None:
+        """没选目标时动作下拉没有意义，灰掉避免误以为已生效。"""
+        kind, tid = self.selected
+        has_target = bool(kind and tid)
+        for combo in self._actions.values():
+            combo.setEnabled(has_target and self.isEnabled())
+
+    def set_row_enabled(self, enabled: bool) -> None:
+        """总开关关闭时整行置灰（含动作下拉与删除按钮）。
+
+        先切行自身的 enabled，Qt 会连带灰化子控件；否则
+        _sync_action_enabled 只看得到「行是启用的」，会把刚灰掉的动作
+        下拉重新打开。
+        """
+        self.setEnabled(enabled)
+        self._combo.setEnabled(enabled)
+        self._remove_btn.setEnabled(enabled)
+        self._sync_action_enabled()
+
+    def _apply_theme(self) -> None:
+        for combo in [self._combo, *self._actions.values()]:
+            apply_combo_qss(combo)
+            combo.set_arrow_color(SiColors.TEXT_SECONDARY)
+        self._remove_btn.setIcon(
+            qta.icon("mdi.close", color=SiColors.TEXT_SECONDARY))
 
 
 class _PagesHost(QWidget):
@@ -121,9 +304,12 @@ class _PagesHost(QWidget):
 class SettingsDialog(OverlayDialog):
     """设置对话框：暗色遮罩 + 居中圆角面板，可拖拽。"""
 
-    def __init__(self, parent=None, devices=None):
+    def __init__(self, parent=None, devices=None, automations=None):
         super().__init__(parent)
         self._devices = devices or []
+        # 自动化列表用于「锁屏联动」的目标下拉；调用方未预取时为空，
+        # 此时仍能保留已配置的自动化条目（见 LockTargetRow 的「未在列表」）
+        self._automations = automations or []
         self.setWindowTitle("设置")
         # 尺寸由 showEvent 按主窗口显隐决定：可见时覆盖主窗口，隐藏时铺满屏幕
         self._header_drag_pos = None
@@ -515,74 +701,96 @@ class SettingsDialog(OverlayDialog):
         ])
 
     def _build_lock_page(self) -> QScrollArea:
-        """锁屏联动页：锁屏/解锁时自动控制哪台设备、在什么条件下生效。
+        """锁屏联动页：一条会话事件可以同时控制多个设备与自动化。
 
-        从「应用功能」页拆出来单独成页：这里有总开关加 7 个从属参数，
-        混在开关列表里会把那一页撑到近两屏。
+        每个联动目标各自持有「启动时 / 解锁时 / 锁屏时」三个状态，因此
+        「解锁开灯 + 停用无人关灯」「锁屏关灯 + 启用无人关灯」这类组合
+        可以一次配好，不必在米家 APP 里再绕一层自动化。
         """
-        # ── 锁屏联动：锁屏/解锁时自动控制设备 ──
+        # ── 锁屏联动：总开关 ──
         self._lock_cfg = settings_store.get_lock_automation()
         self._lock_item, self._lock_label, self._lock_desc, lock_row = self._make_item(
             "锁屏联动",
-            "解锁电脑时自动打开指定设备、锁屏时自动关闭（典型用法：台灯）。"
-            "需保持应用运行，可搭配「开机自启动」与「以系统托盘方式启动」静默常驻")
+            "解锁 / 锁屏电脑时自动控制下面配置的联动目标：设备可打开或关闭，"
+            "自动化可启用或停用，每个目标互不影响。需保持应用运行，"
+            "可搭配「开机自启动」与「以系统托盘方式启动」静默常驻")
         self._lock_toggle = themed_switch()
         self._lock_toggle.setChecked(self._lock_cfg["enabled"])
         _sync_switch(self._lock_toggle)
         lock_row.addWidget(self._lock_toggle)
         self._lock_toggle.toggled.connect(self._on_lock_toggled)
 
-        # 联动设备（子设置，依赖总开关）
-        self._lock_device_item, self._lock_device_label, self._lock_device_desc, \
-            lock_device_row = self._make_item(
-                "联动设备", "锁屏与解锁时自动开关哪台设备（建议选择台灯等开关类设备）")
+        # ── 联动目标：动态行列表（子设置，依赖总开关） ──
+        self._lock_targets_card = QFrame()
+        card = QVBoxLayout(self._lock_targets_card)
+        card.setContentsMargins(14, 10, 14, 10)
+        card.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        self._lock_targets_title = QLabel("联动目标")
+        head.addWidget(self._lock_targets_title)
+        head.addStretch(1)
+        self._lock_add_btn = QPushButton(" 添加目标")
+        self._lock_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lock_add_btn.setIconSize(QSize(14, 14))
+        self._lock_add_btn.clicked.connect(lambda: self._add_lock_row())
+        head.addWidget(self._lock_add_btn)
+        card.addLayout(head)
+
+        self._lock_targets_desc = QLabel(
+            "每行一个目标，三个下拉分别是它在「启动时 / 解锁时 / 锁屏时」"
+            "要执行的动作；同一个目标可以只在一个方向动作（其余选「不操作」）")
+        self._lock_targets_desc.setWordWrap(True)
+        card.addWidget(self._lock_targets_desc)
+
+        # 列头：与行内控件宽度严格对齐（目标列吃掉剩余宽度）
+        columns = QHBoxLayout()
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(6)
+        self._lock_col_labels: list[QLabel] = []
+        col_target = QLabel("目标")
+        col_target.setStyleSheet("background: transparent; font-size: 7pt;")
+        columns.addWidget(col_target, stretch=1)
+        for text in ("启动时", "解锁时", "锁屏时"):
+            label = QLabel(text)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setFixedWidth(_LOCK_ACTION_WIDTH)
+            label.setStyleSheet("background: transparent; font-size: 7pt;")
+            self._lock_col_labels.append(label)
+            columns.addWidget(label)
+        col_gap = QWidget()
+        col_gap.setFixedWidth(24)
+        columns.addWidget(col_gap)
+        card.addLayout(columns)
+
+        self._lock_rows_host = QWidget()
+        rows_layout = QVBoxLayout(self._lock_rows_host)
+        rows_layout.setContentsMargins(0, 0, 0, 0)
+        rows_layout.setSpacing(6)
+        card.addWidget(self._lock_rows_host)
+        self._lock_rows_layout = rows_layout
+
+        self._lock_targets_empty = QLabel(
+            "还没有联动目标。点右上角「添加目标」，可以选设备（如台灯）"
+            "或米家自动化（如「无人关灯」）")
+        self._lock_targets_empty.setWordWrap(True)
+        card.addWidget(self._lock_targets_empty)
+
+        # 候选目标：设备在前（按在线/名称排序），自动化在后（按名称）
         lock_devices = sorted(
             self._devices, key=lambda d: (0 if d.online else 1, d.name, d.did))
-        self._lock_device_options: list[tuple[str, str]] = [
-            ("", "请选择设备"),
-        ] + [(d.did, f"{d.name}（{d.room_name}）") for d in lock_devices]
-        cur_did = self._lock_cfg["did"]
-        cur_label = next(
-            (label for did, label in self._lock_device_options if did == cur_did),
-            self._lock_device_options[0][1],
-        )
-        self._lock_device_combo = themed_combo(
-            [label for _, label in self._lock_device_options], current=cur_label)
-        # 设备名含房间号可能较长：按最长选项文本自适应宽度，避免裁切
-        fm = self._lock_device_combo.fontMetrics()
-        option_labels = [label for _, label in self._lock_device_options]
-        text_w = max((fm.horizontalAdvance(t) for t in option_labels), default=120)
-        self._lock_device_combo.setFixedWidth(min(max(text_w + 48, 150), 300))
-        lock_device_row.addWidget(self._lock_device_combo)
-
-        # 启动时动作（子设置）
-        self._lock_startup_item, self._lock_startup_label, \
-            self._lock_startup_desc, lock_startup_row = self._make_item(
-                "启动时", "应用启动（随系统自启动）后对「联动设备」执行的操作；"
-                "开机不算解锁，靠这一项点亮")
-        self._lock_startup_combo = themed_combo(
-            [_LOCK_ACTION_LABELS[a] for a in ("on", "off", "none")],
-            current=_LOCK_ACTION_LABELS.get(
-                self._lock_cfg["startup_action"], "不操作"))
-        lock_startup_row.addWidget(self._lock_startup_combo)
-
-        # 解锁时动作（子设置）
-        self._lock_unlock_item, self._lock_unlock_label, self._lock_unlock_desc, \
-            lock_unlock_row = self._make_item(
-                "解锁时", "会话解锁后对「联动设备」执行的操作")
-        self._lock_unlock_combo = themed_combo(
-            [_LOCK_ACTION_LABELS[a] for a in ("on", "off", "none")],
-            current=_LOCK_ACTION_LABELS.get(self._lock_cfg["unlock_action"], "打开"))
-        lock_unlock_row.addWidget(self._lock_unlock_combo)
-
-        # 锁屏时动作（子设置）
-        self._lock_lock_item, self._lock_lock_label, self._lock_lock_desc, \
-            lock_lock_row = self._make_item(
-                "锁屏时", "会话锁屏后对「联动设备」执行的操作")
-        self._lock_lock_combo = themed_combo(
-            [_LOCK_ACTION_LABELS[a] for a in ("off", "on", "none")],
-            current=_LOCK_ACTION_LABELS.get(self._lock_cfg["lock_action"], "关闭"))
-        lock_lock_row.addWidget(self._lock_lock_combo)
+        self._lock_target_options: list[tuple[str, str, str, str, str]] = [
+            ("device", d.did, d.name, "", f"{d.name}（{d.room_name}）")
+            for d in lock_devices
+        ] + [
+            ("automation", a.scene_id, a.name, a.home_id, f"自动化·{a.name}")
+            for a in sorted(self._automations, key=lambda a: a.name)
+        ]
+        self._lock_rows: list[LockTargetRow] = []
+        for target in self._lock_cfg["targets"]:
+            self._add_lock_row(target)
 
         # 生效时间（子开关：开启后才受时段约束）
         self._lock_time_item, self._lock_time_label, self._lock_time_desc, \
@@ -648,13 +856,43 @@ class SettingsDialog(OverlayDialog):
         net_layout.addWidget(self._lock_net_now)
         lock_netname_row.addWidget(net_host)
 
+        self._refresh_lock_empty()
         return self._build_scroll([
-            self._lock_item, self._lock_device_item,
-            self._lock_startup_item,
-            self._lock_unlock_item, self._lock_lock_item,
+            self._lock_item, self._lock_targets_card,
             self._lock_time_item, self._lock_span_item,
             self._lock_net_item, self._lock_netname_item,
         ], spacing=4)
+
+    # ---------- 联动目标行 ----------
+
+    def _add_lock_row(self, target: dict | None = None) -> None:
+        """追加一行联动目标；target 为空表示「新增一行空目标」。"""
+        if len(self._lock_rows) >= 20:
+            Toast.info(self, "最多配置 20 个联动目标", 3000)
+            return
+        row = LockTargetRow(self._lock_target_options, target,
+                            self._lock_rows_host)
+        row.removed.connect(self._remove_lock_row)
+        row.set_row_enabled(self._lock_toggle.isChecked())
+        self._lock_rows_layout.addWidget(row)
+        self._lock_rows.append(row)
+        self._refresh_lock_empty()
+        # 新增的空行直接聚焦目标下拉：省一次点击
+        if target is None:
+            row._combo.setFocus()
+
+    def _remove_lock_row(self, row: LockTargetRow) -> None:
+        if row in self._lock_rows:
+            self._lock_rows.remove(row)
+        self._lock_rows_layout.removeWidget(row)
+        row.setParent(None)
+        row.deleteLater()
+        self._refresh_lock_empty()
+
+    def _refresh_lock_empty(self) -> None:
+        """空态提示只在真的没有目标时出现。"""
+        if hasattr(self, "_lock_targets_empty"):
+            self._lock_targets_empty.setVisible(not self._lock_rows)
 
     # ---------- 分类切换 ----------
 
@@ -714,9 +952,7 @@ class SettingsDialog(OverlayDialog):
                      self._speaker_item, self._hide_item, self._hide_off_item,
                      self._scale_item, self._update_item, self._board_item,
                      self._accent_item, self._tray_icon_item,
-                     self._lock_item, self._lock_device_item,
-                     self._lock_startup_item,
-                     self._lock_unlock_item, self._lock_lock_item,
+                     self._lock_item, self._lock_targets_card,
                      self._lock_time_item, self._lock_span_item,
                      self._lock_net_item, self._lock_netname_item):
             item.setStyleSheet(panel_card)
@@ -731,9 +967,7 @@ class SettingsDialog(OverlayDialog):
                       self._speaker_label, self._hide_label, self._hide_off_label,
                       self._scale_label, self._update_label, self._board_label,
                       self._accent_label, self._tray_icon_label,
-                      self._lock_label, self._lock_device_label,
-                      self._lock_startup_label,
-                      self._lock_unlock_label, self._lock_lock_label,
+                      self._lock_label, self._lock_targets_title,
                       self._lock_time_label, self._lock_span_label,
                       self._lock_net_label, self._lock_netname_label):
             label.setStyleSheet(
@@ -743,13 +977,18 @@ class SettingsDialog(OverlayDialog):
                      self._speaker_desc, self._hide_desc, self._hide_off_desc,
                      self._scale_desc, self._update_desc, self._board_desc,
                      self._accent_desc, self._tray_icon_desc,
-                     self._lock_desc, self._lock_device_desc,
-                     self._lock_startup_desc,
-                     self._lock_unlock_desc, self._lock_lock_desc,
+                     self._lock_desc, self._lock_targets_desc,
                      self._lock_time_desc, self._lock_span_desc,
                      self._lock_net_desc, self._lock_netname_desc):
             desc.setStyleSheet(
                 f"color: {SiColors.TEXT_SECONDARY}; background: transparent; font-size: 7pt;")
+        # 联动目标的列头与空态提示：比描述更淡，避免和目标名抢注意力
+        for label in self._lock_col_labels:
+            label.setStyleSheet(
+                f"color: {SiColors.TEXT_SECONDARY}; background: transparent;"
+                " font-size: 7pt;")
+        self._lock_targets_empty.setStyleSheet(
+            f"color: {SiColors.TEXT_FAINT}; background: transparent; font-size: 7pt;")
         # 主按钮文字固定白色（不随深/浅主题翻转）
         self._done_btn.setStyleSheet(primary_button_qss("7px 18px"))
         apply_combo_qss(self._theme_combo)
@@ -757,11 +996,13 @@ class SettingsDialog(OverlayDialog):
         # 界面缩放下拉同样随主题刷新（遗漏曾致切主题后仍保持旧深色样式）
         apply_combo_qss(self._scale_combo, editable=True)
         self._scale_combo.set_arrow_color(SiColors.TEXT_SECONDARY)
-        # 锁屏联动的三个下拉一并刷新，避免切主题后残留旧配色
-        for combo in (self._lock_device_combo,
-                      self._lock_unlock_combo, self._lock_lock_combo):
-            apply_combo_qss(combo)
-            combo.set_arrow_color(SiColors.TEXT_SECONDARY)
+        # 锁屏联动的每行下拉一并刷新，避免切主题后残留旧配色
+        for row in self._lock_rows:
+            row._apply_theme()
+        self._lock_add_btn.setStyleSheet(
+            secondary_button_qss("3px 10px", font_size="9pt"))
+        self._lock_add_btn.setIcon(
+            qta.icon("mdi.plus", color=SiColors.TEXT_PRIMARY))
         # 生效时段的时间字段自带主题上色（内部 QTimeEdit + 自绘步进按钮）
         for field in (self._lock_time_start, self._lock_time_end):
             field.apply_theme()
@@ -1005,20 +1246,16 @@ class SettingsDialog(OverlayDialog):
             settings_store.set_voice_fab_enabled(self._voice_fab_toggle.isChecked())
         settings_store.set_hide_no_func_devices(self._hide_toggle.isChecked())
         settings_store.set_hide_offline_devices(self._hide_off_toggle.isChecked())
-        # 锁屏联动：整份配置写入（下拉文案反查设置值）；
-        # 未选设备时即使勾了启用也不会执行，下次打开设置仍保持勾选状态
-        lock_idx = self._lock_device_combo.currentIndex()
-        lock_did = (self._lock_device_options[lock_idx][0]
-                    if 0 <= lock_idx < len(self._lock_device_options) else "")
+        # 锁屏联动：整份配置写入。目标是「每行一个」的列表，未选目标的
+        # 空行（value() 为 None）直接丢掉；总开关关闭时不删配置，
+        # 用户重新打开时目标还在
+        lock_targets = [
+            value for value in (row.value() for row in self._lock_rows)
+            if value is not None
+        ]
         settings_store.set_lock_automation({
             "enabled": self._lock_toggle.isChecked(),
-            "did": lock_did,
-            "unlock_action": _LOCK_LABEL_TO_ACTION.get(
-                self._lock_unlock_combo.currentText(), "on"),
-            "lock_action": _LOCK_LABEL_TO_ACTION.get(
-                self._lock_lock_combo.currentText(), "off"),
-            "startup_action": _LOCK_LABEL_TO_ACTION.get(
-                self._lock_startup_combo.currentText(), "none"),
+            "targets": lock_targets,
             "time_enabled": self._lock_time_toggle.isChecked(),
             "time_start": self._lock_time_start.time().toString("HH:mm"),
             "time_end": self._lock_time_end.time().toString("HH:mm"),
@@ -1120,16 +1357,13 @@ class SettingsDialog(OverlayDialog):
 
         子项是普通下拉框/输入框（QComboBox/QLineEdit 原生支持置灰），
         只需同步文案配色；两个子开关（SiSwitchRefactor）自绘不响应
-        setEnabled，用透明度灰化。
+        setEnabled，用透明度灰化。联动目标行由行自身置灰（含删除按钮）。
         """
         label_color = SiColors.TEXT_PRIMARY if enabled else SiColors.TEXT_DISABLED
         desc_color = SiColors.TEXT_SECONDARY if enabled else SiColors.TEXT_FAINT
         for label, desc, control in (
-            (self._lock_device_label, self._lock_device_desc, self._lock_device_combo),
-            (self._lock_startup_label, self._lock_startup_desc,
-             self._lock_startup_combo),
-            (self._lock_unlock_label, self._lock_unlock_desc, self._lock_unlock_combo),
-            (self._lock_lock_label, self._lock_lock_desc, self._lock_lock_combo),
+            (self._lock_targets_title, self._lock_targets_desc,
+             self._lock_add_btn),
             (self._lock_span_label, self._lock_span_desc, self._lock_time_start),
             (self._lock_span_label, self._lock_span_desc, self._lock_time_end),
             (self._lock_netname_label, self._lock_netname_desc, self._lock_net_edit),
@@ -1139,6 +1373,11 @@ class SettingsDialog(OverlayDialog):
             desc.setStyleSheet(
                 f"color: {desc_color}; background: transparent; font-size: 7pt;")
             control.setEnabled(enabled)
+        for label in self._lock_col_labels:
+            label.setStyleSheet(
+                f"color: {desc_color}; background: transparent; font-size: 7pt;")
+        for row in self._lock_rows:
+            row.set_row_enabled(enabled)
         self._lock_net_now.setEnabled(enabled)
         for toggle in (self._lock_time_toggle, self._lock_net_toggle):
             if enabled:
