@@ -12,6 +12,8 @@
 没挂资产）主按钮退回「前往下载」，打开浏览器由用户手动处理。
 """
 
+import logging
+
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
@@ -40,6 +42,8 @@ from app.ui.toast import Toast
 
 _PANEL_W = 480
 _PANEL_H = 520
+
+_logger = logging.getLogger(__name__)
 
 
 class UpdateDialog(OverlayDialog):
@@ -126,12 +130,18 @@ class UpdateDialog(OverlayDialog):
         # 文案随「能否自更新」而定：能就地装就写「立即更新」，
         # 否则保持「前往下载」，不做无谓的承诺
         self._self_update = updater.can_self_update(info)
+        # 上一次已经下完（或解压完）但没装成：这次直接装，不再重新下载
+        self._has_cache = self._self_update and updater.has_pending_package(info)
         self._download_btn = QPushButton(
             " 立即更新" if self._self_update else " 前往下载")
         self._download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._download_btn.setIconSize(QSize(18, 18))
         self._download_btn.clicked.connect(self._start_update)
-        if self._self_update and info.asset_size:
+        if self._self_update and self._has_cache:
+            # 这句话本身就是「上次没白下」的交代：重试不会再走一遍网络
+            self._download_btn.setToolTip(
+                "上次已下载好更新包，这次直接安装（失败也不会重新下载）")
+        elif self._self_update and info.asset_size:
             # 在按下之前就让用户知道要下多少、之后会发生什么
             self._download_btn.setToolTip(
                 f"下载约 {info.asset_size / 1048576:.0f} MB，"
@@ -188,9 +198,9 @@ class UpdateDialog(OverlayDialog):
         if not self._self_update or dest is None:
             self._open_download()
             return
-        # 装到 Program Files 又没提权时，替换脚本注定失败：别让用户先
-        # 下完 76 MB 再看到「更新未完成」，直接退回手动下载
-        if not updater.dir_writable(dest):
+        # 装到 Program Files 又没提权时，替换注定失败：别让用户先下完
+        # 80 MB 再看到「更新未完成」，直接退回手动下载
+        if not updater.dir_writable(dest) or not updater.dir_writable(dest.parent):
             Toast.info(
                 self, "安装目录没有写权限，已改为打开下载页，请手动解压覆盖",
                 6000)
@@ -201,9 +211,11 @@ class UpdateDialog(OverlayDialog):
         self._later_btn.setEnabled(False)
         self._progress.setValue(0)
         self._progress.setVisible(True)
-        self._set_status("正在下载更新包…")
-        self._downloader = updater.UpdateDownloader(self._info.asset_url, self)
+        self._set_status("正在准备更新包…")
+        self._downloader = updater.UpdateDownloader(
+            self._info.asset_url, self._info.tag, self._info.asset_size, self)
         self._downloader.progress.connect(self._on_progress)
+        self._downloader.status.connect(self._set_status)
         self._downloader.finished.connect(self._on_downloaded)
         self._downloader.start()
 
@@ -211,39 +223,50 @@ class UpdateDialog(OverlayDialog):
         mb = 1024 * 1024
         if total > 0:
             self._progress.setValue(min(100, int(done * 100 / total)))
+        # 解压阶段也在用同一条进度条，此时 status 已被文字覆盖，
+        # 这里只在下载阶段补「已下载 / 总大小」
+        if total > 0 and self._status.text().startswith("正在下载"):
             self._set_status(
                 f"正在下载更新包… {done / mb:.1f} / {total / mb:.1f} MB")
-        else:
+        elif total <= 0 and self._status.text().startswith("正在下载"):
             self._set_status(f"正在下载更新包… {done / mb:.1f} MB")
 
     def _on_downloaded(self, staging, error) -> None:
         if error is not None:
-            self._restore_after_failure(f"更新失败：{error}")
+            # 半截的包留在缓存里，下次点更新会续传，不会从 0 MB 重来
+            self._restore_after_failure(f"更新未完成：{error}")
             return
         dest = updater.install_dir()
         if dest is None:
             self._restore_after_failure("当前不是安装版，无法自动更新")
             return
         try:
-            updater.apply_update(staging, dest)
+            old = updater.apply_update(staging, dest)
         except Exception as exc:
-            self._restore_after_failure(f"无法启动更新程序：{exc}")
+            _logger.warning("update: apply failed: %s", exc)
+            self._restore_after_failure(f"安装失败：{exc}（更新包已保存，重试无需重新下载）")
+            return
+        # 启动新版并观察几秒：启动即崩会被自动还原，这里就能告诉用户，
+        # 而不是等他下次双击 exe 才发现程序打不开
+        self._set_status(f"正在启动 {self._info.tag}…")
+        if not updater.relaunch_and_verify(old, dest):
+            self._restore_after_failure("新版本启动失败，已自动还原到原版本，可重试或手动下载")
             return
         self._progress.setValue(100)
-        self._set_status("更新已就绪，应用即将重启完成安装…")
+        self._set_status(f"已更新到 {self._info.tag}，正在关闭旧窗口…")
         self._download_btn.setText(" 重启中…")
-        # 留一小段时间让用户看清状态，再把进程交给外部脚本收尾
-        QTimer.singleShot(600, self._quit_for_update)
+        # 留一小段时间让用户看清状态，再把进程让给新版本
+        QTimer.singleShot(500, self._quit_for_update)
 
     def _quit_for_update(self) -> None:
-        """关闭对话框并退出进程：替换脚本要等本进程退出后才能覆盖 exe。"""
+        """关闭对话框并退出进程：新版本已在另一个进程里跑起来了。"""
         self.accept()
         app = QApplication.instance()
         if app is not None:
             app.quit()
 
     def _restore_after_failure(self, message: str) -> None:
-        """下载/替换失败：把界面还原成可重试状态并说明原因。"""
+        """下载/安装失败：把界面还原成可重试状态并说明原因。"""
         if self._downloader is not None:
             self._downloader.deleteLater()
             self._downloader = None
@@ -253,7 +276,7 @@ class UpdateDialog(OverlayDialog):
         self._later_btn.setEnabled(True)
         self._progress.setVisible(False)
         self._status.setVisible(False)
-        Toast.info(self, message, 5000)
+        Toast.info(self, message, 6000)
 
     def _set_status(self, text: str) -> None:
         self._status.setText(text)

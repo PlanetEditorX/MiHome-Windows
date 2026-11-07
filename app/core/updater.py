@@ -1,30 +1,40 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # MiHome-Windows: 米家设备的 Windows 桌面控制端
 # Copyright (C) 2026 MiHome-Windows contributors
-"""应用内更新：下载 Release 资产 → 解压暂存 → 交外部脚本替换并重启。
+"""应用内更新：下载（可续传）→ 落盘缓存 → 解压暂存 → 进程内整目录交换 → 重启。
 
-为什么替换必须交给外部脚本：Windows 不允许覆盖正在运行的 exe，
-而「先退出再复制」又需要有人在本进程之外继续动作。这里的做法是
-生成一个一次性 cmd 脚本，脚本按镜像名轮询到本进程彻底退出后，
-把暂存目录**整目录交换**进安装位置，再启动新版并自删。
+v0.8.3~v0.9.0 用的是「写一个 cmd 脚本、退出进程、由脚本 robocopy + move +
+start」的做法。实测在目标机器上这条链路会在中途静默中断：脚本写了第一行
+日志之后就再没有下文，用户看到的是「下载完成 → 没有任何反应 → 手动点开
+还是旧版本 → 再点更新又从零下载」。脚本本身不可观测、不可调试，也不受
+应用控制（被杀软拦、被 HIPS 终止都表现为「什么都没发生」）。
 
-为什么是目录交换而不是逐文件覆盖：早期版本用 robocopy 直接覆盖安装
-目录，只要有一个文件被占用（exe 尚未释放、杀软正在扫刚写出的 dll），
-复制就会中途失败，目录里留下「新 dll + 旧 exe」的混搭——这样的目录
-启动即崩（用户看到的就是闪退），而下次启动又是旧版本号、再次提示更新，
-于是要更新两三次才装好。现在改为：先把新版本完整复制到安装目录旁的
-`<安装目录>.new`，再用 rename 把 `<安装目录>` 换成 `<安装目录>.old`、
-把 `.new` 顶上去。Windows 只有在目录内所有句柄都释放后才允许改名，
-因此「改名成功」本身就是进程真的退出了的证明；任一步失败就整体回滚
-到旧目录，绝不留下半新半旧的安装。
+因此这里把替换动作整个搬回进程内：
 
-网络请求走独立后台线程（同 update_checker）：下载 76 MB 在弱网下
-可能几十秒，绝不能占住界面线程。
+1. Windows 允许改名一个**正在运行**的目录及其中的 exe（只是不允许删除），
+   所以完全可以在应用还活着的时候把 `<安装目录>` 改名为 `<安装目录>.old`，
+   再把已经解压好的 `<安装目录>.new` 顶上去。整目录改名是原子的，不存在
+   「新 dll + 旧 exe」的混搭中间态。
+2. 替换完立刻启动新版本并观察 6 秒：活着才算成功；启动即崩就把旧目录换回来，
+   应用继续照常运行（不会出现「点完更新，程序没了」）。
+3. 所有失败都在对话框里当场说明，不再依赖「下次启动看标记文件」。
+
+另外两点是这一版新增的：
+- **下载包落盘缓存**：按版本号存在数据目录的 `update/` 下，一次下不完支持
+  断点续传（HTTP Range）。第二次点更新先用上次的包，包不完整才续传，
+  续传失败才从头下载——不再每次都从 0 MB 开始。
+- **解压结果也复用**：`<安装目录>.new` 若已经解压完整且版本号匹配，直接拿来
+  用，重试时既不用下载也不用解压。
 """
 
+import json
+import logging
+import os
+import shutil
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -34,119 +44,27 @@ from PySide6.QtCore import QObject, QProcess, Signal
 # 打包产物里主程序的文件名（build.ps1 固定产出）
 EXE_NAME = "MiHome-Windows.exe"
 
+# 兼容旧版本留下的失败标记与日志名：v0.9.1 之前由 cmd 脚本写入 / 提示里
+# 引用，升级上来的机器可能还留着，读取路径保持不变
+FAILURE_FLAG = "mihome_update_failed.txt"
+UPDATE_LOG = "mihome_update.log"
+
+# 暂存目录里标记「已解压完整」的文件；内容是 {"tag": "v0.9.1"}
+_STAGED_MARK = ".mihome-staged.json"
+
 _CHUNK = 256 * 1024
 
-# 更新脚本模板。刻意保持纯 ASCII：cmd 的代码页随系统而变，中文注释
-# 在部分环境会乱码甚至被当成命令执行；路径由调用方以完整绝对路径填入。
-#
-# 所有系统工具都写 %SystemRoot%\System32 绝对路径：裸名会走 PATH，而
-# 用户装了 Git/MSYS、Cygwin 等工具链时 PATH 里常有同名 find.exe，会抢在
-# 系统的 find 之前被调用（实测 `find /I` 被 GNU find 当成路径而报错），
-# 让「等进程退出」的轮询静默失效、进而覆盖正在使用的 exe。
-_SCRIPT_TEMPLATE = """@echo off
-setlocal enabledelayedexpansion
-set "SYS=%SystemRoot%\\System32"
-set "SRC={src}"
-set "DST={dst}"
-set "EXE={exe}"
-set "FLAG=%TEMP%\\{flag}"
-set "LOG=%TEMP%\\{log}"
+# 启动新版后观察多久才认定「活着」。太短会把正常启动误判成崩溃，太长
+# 让用户对着「正在重启」干等
+_VERIFY_SECONDS = 6.0
 
-rem sibling dirs used for the swap: same volume, so rename stays atomic
-for %%A in ("%DST%") do (
-  set "DPARENT=%%~dpA"
-  set "DNAME=%%~nxA"
-)
-set "NEW=%DPARENT%%DNAME%.new"
-set "OLD=%DPARENT%%DNAME%.old"
+# 改名重试窗口：刚退出/杀软还在扫 exe 时改名会短暂失败，重试即可
+_RENAME_SECONDS = 8.0
 
-echo [%DATE% %TIME%] start src="%SRC%" dst="%DST%" >> "%LOG%"
-del "%FLAG%" 2>nul
+_logger = logging.getLogger(__name__)
 
-rem ---- 0. drop leftovers from a previous attempt ----
-if exist "%OLD%" rd /s /q "%OLD%" 2>nul
-if exist "%NEW%" rd /s /q "%NEW%" 2>nul
-
-rem ---- 1. stage the new build beside the install dir (never touches the live exe) ----
-"%SYS%\\robocopy.exe" "%SRC%" "%NEW%" /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> "%LOG%" 2>&1
-echo [%DATE% %TIME%] stage rc=%ERRORLEVEL% >> "%LOG%"
-if not exist "%NEW%\\%EXE%" (
-  echo [%DATE% %TIME%] stage incomplete, abort >> "%LOG%"
-  echo stage failed > "%FLAG%"
-  goto keepold
-)
-
-rem ---- 2. swap whole directories ----
-rem A directory can be renamed only after every handle inside it is gone, so
-rem retrying the rename is a far more accurate "is it still running?" test
-rem than matching the image name in tasklist (which would also match a copy
-rem installed somewhere else, and make us wait for nothing).
-set /a n=0
-:swap
-move "%DST%" "%OLD%" >nul 2>&1
-if not errorlevel 1 goto swapped
-set /a n+=1
-if !n! lss 90 (
-  "%SYS%\\ping.exe" -n 2 127.0.0.1 >nul
-  goto swap
-)
-echo [%DATE% %TIME%] dst busy, rename failed after !n! tries >> "%LOG%"
-echo rename failed > "%FLAG%"
-goto keepold
-
-:swapped
-move "%NEW%" "%DST%" >nul 2>&1
-if errorlevel 1 (
-  rem put the old build back: a missing install dir is worse than a failed update
-  move "%OLD%" "%DST%" >nul 2>&1
-  echo [%DATE% %TIME%] swap failed, rolled back >> "%LOG%"
-  echo swap failed > "%FLAG%"
-  goto keepold
-)
-echo [%DATE% %TIME%] swapped ok >> "%LOG%"
-
-rem ---- 3. start the new build and make sure it survives ----
-start "" /D "%DST%" "%DST%\\%EXE%"
-if errorlevel 1 echo [%DATE% %TIME%] start failed rc=%ERRORLEVEL% >> "%LOG%"
-"%SYS%\\ping.exe" -n 5 127.0.0.1 >nul
-"%SYS%\\tasklist.exe" /FI "IMAGENAME eq %EXE%" 2>nul | "%SYS%\\findstr.exe" /I "%EXE%" >nul
-if errorlevel 1 (
-  rem the fresh build died right after launch: put the previous one back,
-  rem otherwise the user is left with an app that never opens
-  echo [%DATE% %TIME%] new build exited, rolling back >> "%LOG%"
-  move "%DST%" "%NEW%" >nul 2>&1
-  if not errorlevel 1 move "%OLD%" "%DST%" >nul 2>&1
-  echo startup failed > "%FLAG%"
-  if exist "%DST%\\%EXE%" start "" /D "%DST%" "%DST%\\%EXE%"
-) else (
-  rd /s /q "%OLD%" 2>nul
-)
-
-rem ---- 4. cleanup ----
-rd /s /q "%SRC%" 2>nul
-rd /s /q "%NEW%" 2>nul
-echo [%DATE% %TIME%] done >> "%LOG%"
-rem (goto) makes cmd stop reading this file first, so deleting it here does
-rem not produce a trailing "batch file cannot be found" error
-(goto) 2>nul & del "%~f0"
-exit /b 0
-
-:keepold
-rem Never leave a half-updated dir behind: it starts and crashes immediately,
-rem which reads as "update broke the app". Bring the old build back instead.
-if exist "%DST%\\%EXE%" start "" /D "%DST%" "%DST%\\%EXE%"
-rd /s /q "%SRC%" 2>nul
-rd /s /q "%NEW%" 2>nul
-echo [%DATE% %TIME%] aborted, old build kept >> "%LOG%"
-(goto) 2>nul & del "%~f0"
-exit /b 1
-"""
-
-# 更新失败标记：脚本放弃替换时写到 %TEMP%，下次启动由界面提示并清除
-FAILURE_FLAG = "mihome_update_failed.txt"
-
-# 替换脚本的诊断日志：每次更新追加一段，失败时把路径告诉用户
-UPDATE_LOG = "mihome_update.log"
+# QProcess 的局部变量被回收时子进程可能被判定为「孤儿」，挂到模块上保活
+_launched_proc: QProcess | None = None
 
 
 def failure_flag_path() -> Path:
@@ -168,7 +86,7 @@ def can_self_update(info) -> bool:
 
 
 def dir_writable(dest: Path) -> bool:
-    """安装目录能不能写：决定取不取这条下载（别下完 76 MB 才发现没权限）。
+    """安装目录能不能写：决定取不取这条下载（别下完 80 MB 才发现没权限）。
 
     装在 Program Files 且未提权的场景很常见，提前探一次比让用户白等
     几分钟强。
@@ -182,83 +100,259 @@ def dir_writable(dest: Path) -> bool:
         return False
 
 
-class UpdateDownloader(QObject):
-    """后台下载并解压更新包；progress/finished 都在主线程发出。"""
+# ---------------------------------------------------------------- 缓存位置
 
-    # (已下载字节, 总字节)；总字节为 0 表示服务端未给 Content-Length
+def _safe_tag(tag: str) -> str:
+    """版本号转目录名：去掉 v 前缀与任何路径分隔符。"""
+    text = str(tag or "").strip().lower().lstrip("v")
+    keep = "".join(c for c in text if c.isalnum() or c in "._-")
+    return keep or "latest"
+
+
+def cache_root() -> Path:
+    """更新包缓存目录。放在数据目录而非 %TEMP%：TEMP 会被系统/清理软件
+    随时删掉，而这里的包正是「下次点更新别再重下」的凭据。"""
+    from app.core import _json_store
+
+    return _json_store.data_dir() / "update"
+
+
+def cached_archive(tag: str) -> Path:
+    safe = _safe_tag(tag)
+    return cache_root() / safe / f"MiHome-Windows-{safe}-win64.zip"
+
+
+def staged_dir(dest: Path) -> Path:
+    """新版本的暂存目录：安装目录的同级 `<安装目录>.new`（同卷才能改名）。"""
+    return dest.with_name(dest.name + ".new")
+
+
+def _read_staged_mark(staged: Path) -> dict:
+    try:
+        return json.loads((staged / _STAGED_MARK).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def staged_ready(staged: Path, tag: str) -> bool:
+    """暂存目录是否「完整且就是目标版本」。"""
+    if not (staged / EXE_NAME).exists():
+        return False
+    mark = _read_staged_mark(staged)
+    return bool(mark) and str(mark.get("tag") or "") == str(tag or "")
+
+
+def has_pending_package(info_or_tag) -> bool:
+    """是否已有可直接安装的下载/解压结果（界面据此把按钮写成「立即安装」）。
+
+    只做便宜的判断（文件存在 + 有几个字节），真正的完整性校验放到安装
+    阶段——在对话框构建时跑一遍 80 MB 的 CRC 校验会让窗口卡住一两秒。
+    """
+    tag = getattr(info_or_tag, "tag", info_or_tag)
+    dest = install_dir()
+    if dest is None:
+        return False
+    if staged_ready(staged_dir(dest), tag):
+        return True
+    archive = cached_archive(tag)
+    try:
+        return archive.is_file() and archive.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def archive_ok(path: Path) -> bool:
+    """缓存 zip 是否完整可用：能打开、含主程序、CRC 全对。
+
+    必须校验 CRC——半截的包解压出来会缺 DLL，装上去就是「启动即崩」，
+    比重新下载慢得多。
+    """
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        with zipfile.ZipFile(path) as zf:
+            names = [m.filename.replace("\\", "/").rsplit("/", 1)[-1]
+                     for m in zf.infolist()]
+            if EXE_NAME not in names:
+                return False
+            return zf.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+# ---------------------------------------------------------------- 下载器
+
+class UpdateDownloader(QObject):
+    """后台准备更新包（下载 → 校验 → 解压暂存）；信号都回主线程。
+
+    三条短路依次生效，越靠前越省事：
+    1. `.new` 已解压完整 → 什么都不做，直接安装；
+    2. 缓存 zip 完整 → 跳过下载，只解压；
+    3. 缓存 zip 半截 → 带 Range 续传，续传被拒才从头下。
+    """
+
+    # (已下载字节, 总字节)；总字节为 0 表示服务端未给长度
     progress = Signal(int, int)
+    # 阶段文案（下载中 / 解压中 / 复用缓存…），直接显示在对话框里
+    status = Signal(str)
     # (暂存目录 Path 或 None, 异常或 None)
     finished = Signal(object, object)
 
-    def __init__(self, url: str, parent=None):
+    def __init__(self, url: str, tag: str = "", size: int = 0, parent=None):
         super().__init__(parent)
         self._url = url
+        self._tag = str(tag or "")
+        self._size = int(size or 0)
         self._cancelled = False
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True).start()
 
     def cancel(self) -> None:
-        """请求取消；下载循环在下一个分片处退出。"""
+        """请求取消；下载/解压循环在下一个分片处退出。"""
         self._cancelled = True
 
     def _run(self) -> None:
         try:
-            staging = self._fetch()
+            staged = self._prepare()
         except Exception as exc:  # 网络/解压异常全部转回调，不打崩进程
+            _logger.warning("update: prepare failed: %s", exc)
             self.finished.emit(None, exc)
         else:
-            self.finished.emit(staging, None)
+            self.finished.emit(staged, None)
 
-    def _fetch(self) -> Path:
+    # ---------- 三个步骤 ----------
+
+    def _prepare(self) -> Path:
+        dest = install_dir()
+        if dest is None:
+            raise RuntimeError("当前不是安装版，无法应用内更新")
+
+        staged = staged_dir(dest)
+        if staged_ready(staged, self._tag):
+            _logger.info("update: reuse staged %s", staged)
+            self.status.emit("使用上次已解压好的更新包…")
+            self.progress.emit(1, 1)
+            return staged
+
+        archive = cached_archive(self._tag)
+        if archive_ok(archive):
+            _logger.info("update: reuse archive %s", archive)
+            self.status.emit("使用已下载的更新包，无需重新下载…")
+        else:
+            self._download(archive)
+
+        self._extract(archive, staged)
+        return staged
+
+    def _download(self, archive: Path) -> None:
         from app import __version__
 
-        # 解压直接落在 mkdtemp 根目录：交出去的路径本身就是「可以整个
-        # 删掉」的临时目录，替换脚本用一次 rd /s /q 就能清理干净，不必
-        # 去动它的父目录（父目录里可能有别的东西）
-        staging = Path(tempfile.mkdtemp(prefix="mihome-update-"))
-        archive = staging / "update.zip"
-        try:
-            with requests.get(
-                self._url,
-                stream=True,
-                timeout=(8, 60),
-                headers={
-                    "User-Agent": f"MiHome-Windows/{__version__}",
-                    "Accept": "application/octet-stream",
-                },
-            ) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get("Content-Length") or 0)
-                done = 0
-                self.progress.emit(0, total)
-                with open(archive, "wb") as fp:
-                    for chunk in resp.iter_content(_CHUNK):
-                        if self._cancelled:
-                            raise RuntimeError("更新已取消")
-                        if not chunk:
-                            continue
-                        fp.write(chunk)
-                        done += len(chunk)
-                        self.progress.emit(done, total)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        part = archive.parent / (archive.name + ".part")
+        have = part.stat().st_size if part.exists() else 0
 
-            with zipfile.ZipFile(archive) as zf:
-                # 只接受普通文件/目录，挡住 zip 里的绝对路径与 .. 穿越
-                for member in zf.infolist():
-                    target = (staging / member.filename).resolve()
-                    if not str(target).startswith(str(staging.resolve())):
-                        raise RuntimeError("更新包包含非法路径")
-                zf.extractall(staging)
+        # 上次其实已经下完、只是没来得及改名（进程被杀/断电）。此时若还带
+        # Range 去续传，服务端会回 416，用户看到的是莫名其妙的客户端报错
+        if have and self._size and have >= self._size:
+            part.replace(archive)
+            if archive_ok(archive):
+                _logger.info("update: leftover part was already complete")
+                return
             archive.unlink(missing_ok=True)
+            have = 0
 
-            root = _app_root(staging)
-            if not (root / EXE_NAME).exists():
+        headers = {
+            "User-Agent": f"MiHome-Windows/{__version__}",
+            "Accept": "application/octet-stream",
+        }
+        if have:
+            headers["Range"] = f"bytes={have}-"
+            _logger.info("update: resume from %d bytes", have)
+            self.status.emit("继续下载上次未完成的更新包…")
+
+        with requests.get(self._url, stream=True, timeout=(8, 60),
+                          headers=headers) as resp:
+            if have and resp.status_code == 200:
+                # 服务端不认 Range：只能丢掉半包重来
+                _logger.info("update: server ignored Range, restart download")
+                have = 0
+                part.unlink(missing_ok=True)
+            elif have and resp.status_code != 206:
+                raise RuntimeError(f"续传失败（HTTP {resp.status_code}），请重试")
+            resp.raise_for_status()
+
+            total = _total_bytes(resp, have, self._size)
+            done = have
+            self.progress.emit(done, total)
+            if not have:
+                self.status.emit("正在下载更新包…")
+            with open(part, "ab" if have else "wb") as fp:
+                for chunk in resp.iter_content(_CHUNK):
+                    if self._cancelled:
+                        raise RuntimeError("更新已取消")
+                    if not chunk:
+                        continue
+                    fp.write(chunk)
+                    done += len(chunk)
+                    self.progress.emit(done, total)
+
+        if self._size and part.stat().st_size < self._size:
+            # 连接中途断掉：把半包留下，下次续传
+            raise RuntimeError(
+                f"下载未完成（{part.stat().st_size} / {self._size} 字节），请重试")
+
+        part.replace(archive)
+        if not archive_ok(archive):
+            archive.unlink(missing_ok=True)
+            raise RuntimeError("更新包校验失败（可能下载不完整），请重试")
+
+    def _extract(self, archive: Path, staged: Path) -> None:
+        self.status.emit("正在解压新版本…")
+        # 上一轮的半成品必须先清掉：留下缺 DLL 的目录会装出「启动即崩」的版本
+        if staged.exists():
+            _rmtree(staged)
+        staged.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                members = zf.infolist()
+                total = max(1, len(members))
+                root = staged.resolve()
+                for index, member in enumerate(members, 1):
+                    if self._cancelled:
+                        raise RuntimeError("更新已取消")
+                    target = (staged / member.filename).resolve()
+                    # 只接受解压目录内的路径，挡住 zip 里的 .. 穿越与绝对路径
+                    if target != root and root not in target.parents:
+                        raise RuntimeError("更新包包含非法路径")
+                    zf.extract(member, staged)
+                    if index % 40 == 0 or index == total:
+                        # 先改文案再动进度条：进度回调会按阶段决定要不要
+                        # 覆盖状态文字，顺序反了会闪一下「正在下载」
+                        self.status.emit(
+                            f"正在解压新版本… {index * 100 // total}%")
+                        self.progress.emit(index, total)
+            _flatten(staged)
+            if not (staged / EXE_NAME).exists():
                 raise RuntimeError(f"更新包里没有 {EXE_NAME}")
-            return root
+            (staged / _STAGED_MARK).write_text(
+                json.dumps({"tag": self._tag}), encoding="utf-8")
         except Exception:
-            # 失败时清掉暂存，避免 %TEMP% 里堆半成品
-            _rmtree(staging)
+            _rmtree(staged)
             raise
+
+
+def _total_bytes(resp, have: int, fallback: int) -> int:
+    """算总长：优先 Content-Range 的总量，其次 Content-Length + 已有，最后用资产大小。"""
+    rng = resp.headers.get("Content-Range") or ""
+    if "/" in rng:
+        tail = rng.rsplit("/", 1)[-1].strip()
+        if tail.isdigit():
+            return int(tail)
+    length = resp.headers.get("Content-Length")
+    if length and str(length).isdigit():
+        return have + int(length)
+    return fallback
 
 
 def _app_root(root: Path) -> Path:
@@ -274,41 +368,169 @@ def _app_root(root: Path) -> Path:
     return root
 
 
+def _flatten(staged: Path) -> None:
+    """把 zip 里多出来的那层同名目录拉平，让 staged 本身就是程序根。"""
+    inner = _app_root(staged)
+    if inner == staged:
+        return
+    tmp = staged.with_name(staged.name + ".flat")
+    _rmtree(tmp)
+    os.rename(inner, tmp)
+    _rmtree(staged)
+    os.rename(tmp, staged)
+
+
 def _rmtree(path: Path) -> None:
-    import shutil
+    shutil.rmtree(path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- 安装
+
+def _rename_retry(src: Path, dst: Path, timeout: float = _RENAME_SECONDS) -> None:
+    """在超时窗口内反复尝试改名。
+
+    刚退出的进程、正在扫描新文件的杀软都会让改名短暂失败（共享冲突），
+    重试几百毫秒基本都能过；一直失败就抛出去由调用方回滚并提示。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.rename(src, dst)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
+def _fresh_old_dir(dest: Path) -> Path:
+    """给旧版本找一个可用的备份目录名（优先 `<安装目录>.old`）。"""
+    preferred = dest.with_name(dest.name + ".old")
+    if preferred.exists():
+        _rmtree(preferred)
+    if not preferred.exists():
+        return preferred
+    return dest.with_name(f"{dest.name}.old-{int(time.time())}")
+
+
+def apply_update(staged: Path, dest: Path) -> Path:
+    """把暂存的新版本换成安装目录，返回旧版本所在目录。
+
+    整个过程在应用还活着的时候完成：整目录改名不要求里面的文件先关闭
+    （Windows 只禁止删除运行中的 exe，不禁止改名）。任一步失败都回滚，
+    绝不留下半新半旧的目录——那种目录启动即崩，正是「要装两三次」的根因。
+    """
+    if not (staged / EXE_NAME).exists():
+        raise RuntimeError(f"暂存目录里没有 {EXE_NAME}")
+    if not dir_writable(dest):
+        raise RuntimeError("安装目录不可写（可能装在了 Program Files）")
+    if not dir_writable(dest.parent):
+        raise RuntimeError("安装目录所在文件夹不可写，无法完成替换")
+
+    old = _fresh_old_dir(dest)
+    _logger.info("update: swap %s -> %s", dest, old)
+    try:
+        _rename_retry(dest, old)
+    except OSError as exc:
+        raise RuntimeError(f"安装目录被占用，无法替换（{exc}）") from exc
 
     try:
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
+        _rename_retry(staged, dest)
+    except OSError as exc:
+        try:
+            os.rename(old, dest)
+        except OSError:
+            _logger.exception("update: rollback failed after swap error")
+        raise RuntimeError(f"新版本就位失败（{exc}），已还原旧版本") from exc
+
+    (dest / _STAGED_MARK).unlink(missing_ok=True)
+    _logger.info("update: swapped, new build at %s", dest)
+    return old
+
+
+def _rollback(dest: Path, old: Path) -> None:
+    """新版启动即崩：把坏目录挪开、旧目录还原回安装位置。"""
+    bad = dest.with_name(dest.name + ".bad")
+    _rmtree(bad)
+    try:
+        os.rename(dest, bad)
+    except OSError:
+        _logger.exception("update: cannot move broken build aside")
+        return
+    try:
+        os.rename(old, dest)
+    except OSError:
+        _logger.exception("update: rollback rename failed")
+        try:
+            os.rename(bad, dest)
+        except OSError:
+            _logger.exception("update: cannot restore new build either")
+        return
+    _rmtree(bad)
+    try:
+        failure_flag_path().write_text("startup failed", encoding="utf-8")
+    except OSError:
         pass
 
 
-def apply_update(staging: Path, dest: Path) -> Path:
-    """生成并启动替换脚本，返回脚本路径；调用方随后应立即退出进程。"""
-    script = Path(tempfile.gettempdir()) / "mihome_update.cmd"
-    script.write_text(
-        _SCRIPT_TEMPLATE.format(
-            src=str(staging), dst=str(dest), exe=EXE_NAME, flag=FAILURE_FLAG,
-            log=UPDATE_LOG),
-        encoding="ascii",
-        errors="replace",
-    )
-    launched = QProcess.startDetached("cmd.exe", ["/c", str(script)])
-    if not launched:
-        raise RuntimeError("无法启动更新脚本")
-    return script
+def relaunch_and_verify(old: Path, dest: Path,
+                        wait: float = _VERIFY_SECONDS) -> bool:
+    """启动新版本并确认它活着；启动即崩则回滚旧版本并返回 False。
 
+    由**旧进程**执行：先带 MIHOME_RESTARTED=1 起新进程（跳过单实例判定，
+    否则新进程会被当成「唤醒旧窗口」直接退出），观察 wait 秒。期间持续
+    处理界面事件，进度条不会假死。
+    """
+    global _launched_proc
+
+    exe = dest / EXE_NAME
+    if not exe.exists():
+        _logger.error("update: %s missing after swap", exe)
+        _rollback(dest, old)
+        return False
+
+    os.environ["MIHOME_RESTARTED"] = "1"
+    proc = QProcess()
+    proc.setProgram(str(exe))
+    proc.setWorkingDirectory(str(dest))
+    proc.start()
+    if not proc.waitForStarted(15000):
+        _logger.error("update: new build failed to start")
+        _rollback(dest, old)
+        return False
+
+    _launched_proc = proc
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if proc.state() == QProcess.ProcessState.NotRunning:
+            break
+        if app is not None:
+            app.processEvents()
+        time.sleep(0.05)
+
+    if proc.state() == QProcess.ProcessState.NotRunning:
+        _logger.error(
+            "update: new build exited immediately (code %s), rolling back",
+            proc.exitCode())
+        _rollback(dest, old)
+        return False
+
+    _logger.info("update: new build alive, old build kept at %s", old)
+    return True
+
+
+# ---------------------------------------------------------------- 清理
 
 def cleanup_leftovers() -> None:
     """清理上次更新留下的残渣（启动时调用，失败静默）。
 
-    两类东西会留下来：%TEMP% 下的 staging 目录（替换脚本收尾时 `rd` 被
-    杀软占着删不掉），以及安装目录旁的 `<目录>.old` / `.new` 备份目录。
-    它们不影响运行，但每次更新叠一个，久了会占几百 MB。
+    三类东西会留下来：旧版脚本在 %TEMP% 下的解压目录、安装目录旁的
+    `.old` / `.bad` 备份、以及缓存里其它版本的包。`.new` 只要还是完整的
+    就保留——那正是「下次点更新不用重下」的凭据。
     """
-    import shutil
-    import time
-
     tmp = Path(tempfile.gettempdir())
     cutoff = time.time() - 300      # 跳过 5 分钟内刚建的：可能正是本次更新在用
     try:
@@ -320,17 +542,48 @@ def cleanup_leftovers() -> None:
                     continue
             except OSError:
                 continue
-            shutil.rmtree(path, ignore_errors=True)
+            _rmtree(path)
     except OSError:
         pass
 
     dest = install_dir()
     if dest is None:
         return
-    for suffix in (".old", ".new"):
-        stale = dest.with_name(dest.name + suffix)
-        try:
-            if stale.is_dir():
-                shutil.rmtree(stale, ignore_errors=True)
-        except OSError:
-            pass
+
+    # .old / .bad（含带时间戳的变体）：旧版本进程退出后就能删了
+    for stale in dest.parent.glob(dest.name + ".*"):
+        suffix = stale.name[len(dest.name):]
+        if not suffix.startswith((".old", ".bad")):
+            continue
+        for _ in range(3):
+            if not stale.exists():
+                break
+            _rmtree(stale)
+            if stale.exists():
+                time.sleep(0.4)
+
+    # 暂存目录：完整且新鲜就留着，半成品或放太久一律清掉
+    staged = staged_dir(dest)
+    try:
+        if staged.is_dir():
+            age = time.time() - staged.stat().st_mtime
+            complete = bool(_read_staged_mark(staged)) and (staged / EXE_NAME).exists()
+            if not complete or age > 7 * 86400:
+                _rmtree(staged)
+    except OSError:
+        pass
+
+    _prune_cache()
+
+
+def _prune_cache(keep: int = 1) -> None:
+    """缓存只留最近处理过的 keep 个版本，避免每个版本堆 80 MB。"""
+    root = cache_root()
+    try:
+        dirs = sorted(
+            (p for p in root.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for extra in dirs[keep:]:
+        _rmtree(extra)

@@ -5,7 +5,17 @@
 # 本程序为自由软件，基于 GPL-3.0 或更高版本发布；在遵守许可证的前提下，
 # 你可以自由使用、修改和再分发它。本程序不含任何担保，详见 LICENSE 文件。
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
+
+# 上游基线。本仓库是 huanyuejue/MiHome-Windows 的 fork：合并上游之后必须
+# 同步这三项（版本号 / 合并点提交 / 仓库名），它们会被「关于」页与发布
+# 说明引用。理由很实际——用户看到的是这个 fork 的版本号（0.9.x），但功能
+# 里有相当一部分来自上游（0.5.0），不写明基线就无从判断「我提的问题到底
+# 属于上游行为还是这里的改动」。
+UPSTREAM_REPO = "huanyuejue/MiHome-Windows"
+UPSTREAM_VERSION = "0.5.0"
+UPSTREAM_COMMIT = "41adea4"
+UPSTREAM_URL = f"https://github.com/{UPSTREAM_REPO}"
 
 import logging
 import sys

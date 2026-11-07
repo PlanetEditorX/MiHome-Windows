@@ -20,7 +20,13 @@ from PySide6.QtWidgets import (
 
 import qtawesome as qta
 
-from app import __version__, resource_path
+from app import (
+    UPSTREAM_COMMIT,
+    UPSTREAM_REPO,
+    UPSTREAM_VERSION,
+    __version__,
+    resource_path,
+)
 from app.ui.overlay_dialog import OverlayDialog
 from app.ui.si_theme import (
     PRIMARY_TEXT,
@@ -119,7 +125,18 @@ class AboutDialog(OverlayDialog):
         if api_version:
             version_text += f"　·　mijiaAPI {api_version}"
         self._version_label = QLabel(version_text)
+        self._version_label.setToolTip(
+            f"上游仓库：{UPSTREAM_REPO}\n"
+            f"合并点：{UPSTREAM_COMMIT}（v{UPSTREAM_VERSION}）")
         title_col.addWidget(self._version_label)
+        # 上游基线单独一行：功能里有大半来自上游，只写 fork 的版本号会让人
+        # 分不清某条行为是上游带来的还是这里的改动。挤进版本行会被右边界裁掉
+        self._upstream_label = QLabel(
+            f"上游基线：{UPSTREAM_REPO} v{UPSTREAM_VERSION}（{UPSTREAM_COMMIT}）")
+        self._upstream_label.setToolTip(
+            f"本软件是 {UPSTREAM_REPO} 的 fork，"
+            f"当前基于上游 v{UPSTREAM_VERSION} 合并点 {UPSTREAM_COMMIT}")
+        title_col.addWidget(self._upstream_label)
         head.addLayout(title_col, stretch=1)
         head.addWidget(self._make_close_button(),
                        alignment=Qt.AlignmentFlag.AlignTop)
@@ -290,6 +307,9 @@ class AboutDialog(OverlayDialog):
         self._version_label.setStyleSheet(
             f"color: {SiColors.TEXT_SECONDARY}; background: transparent;"
             " font-size: 9.5pt;")
+        self._upstream_label.setStyleSheet(
+            f"color: {SiColors.TEXT_MUTED}; background: transparent;"
+            " font-size: 8.5pt;")
         self._intro_label.setStyleSheet(
             f"color: {SiColors.TEXT_SECONDARY}; background: transparent;"
             " font-size: 10pt;")

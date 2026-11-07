@@ -51,9 +51,9 @@ def prompt_new_version(parent, info) -> None:
 def notify_pending_update_failure(parent) -> None:
     """上次应用内更新没成功时提示一次。
 
-    替换脚本发现安装目录被占用（进程/杀软还没放手）时会整体放弃、
-    保留旧版本并启动它，同时写标记。现在不会留下半新半旧的目录，
-    所以这里说清「还是旧版本、可以重试」，并给出日志位置供排查。
+    从 v0.9.1 起替换动作在进程内完成，失败当场就有对话框说明，正常情况下
+    不会再留下这个标记；这里保留是为了兼容 v0.9.0 及更早版本（cmd 脚本）
+    留下的标记文件，避免静默。
     """
     from app.core import updater
 
@@ -64,10 +64,17 @@ def notify_pending_update_failure(parent) -> None:
         marker.unlink()
     except OSError:
         return
+
+    log_hint = ""
+    try:
+        from app.core import _json_store
+
+        log_hint = f"（日志：{_json_store.data_file('debug.log')}）"
+    except Exception:
+        pass
     Toast.info(
         parent,
-        "上次更新未完成（安装目录被占用或权限不足），仍是原版本。"
-        "请关闭其他窗口后重试，或到 GitHub 手动下载"
-        f"（日志：%TEMP%\\{updater.UPDATE_LOG}）",
+        "上次更新没装成，仍是原版本。更新包已保存在本地，"
+        f"再次点「立即更新」会直接重装、不会重新下载{log_hint}",
         8000,
     )
