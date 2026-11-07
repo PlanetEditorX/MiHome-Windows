@@ -216,13 +216,27 @@ def _select_label(row, label: str) -> None:
     row._combo.setCurrentIndex(index)
 
 
-# 换目标类型时动作下拉文案跟着换、值不丢
-_select_label(dev_row, "自动化·无人关灯")
+# 已选目标必须从其它行下拉里消失，自己那行仍保留
+assert dev_row._combo.findText("自动化·无人关灯") == -1, \
+    "第二行已选的自动化仍出现在第一行下拉里"
+assert auto_row._combo.findText("Yeelight 显示器挂灯（书房）") == -1, \
+    "第一行已选的设备仍出现在第二行下拉里"
+assert auto_row._combo.findText("自动化·无人关灯") >= 0, \
+    "本行自己选中的目标不该被过滤掉"
+assert dev_row._combo.findText("自动化·夜间回家开灯") >= 0
+
+# 换目标类型时动作下拉文案跟着换、值不丢；同时验证过滤是实时的
+_select_label(dev_row, "自动化·夜间回家开灯")
 assert dev_row._actions["unlock"].currentText() == "启用", \
     "设备换成自动化后动作文案没跟着变"
 assert dev_row._actions["unlock"].currentIndex() == 0, \
     "换目标类型把已选动作打乱了"
+assert auto_row._combo.findText("自动化·夜间回家开灯") == -1, \
+    "第一行改选后，新目标没有从第二行下拉里过滤掉"
+assert auto_row._combo.findText("Yeelight 显示器挂灯（书房）") >= 0, \
+    "第一行释放的旧设备没有回到第二行下拉里"
 _select_label(dev_row, "Yeelight 显示器挂灯（书房）")  # 换回台灯
+assert auto_row._combo.findText("自动化·夜间回家开灯") >= 0
 
 # 新增一行、选一个目标、设置三个方向
 dlg4._add_lock_row()
@@ -268,5 +282,52 @@ assert len(cfg["targets"]) == 1 and cfg["targets"][0]["id"] == "scX", \
     f"打开设置点保存把未加载的自动化目标抹掉了: {cfg['targets']}"
 dlg5.deleteLater()
 print("8. 未加载的目标保存后不丢失 OK")
+
+# ---------- 9. 无黑色原生 tooltip；过滤随增删实时更新 ----------
+from PySide6.QtCore import Qt  # noqa: E402
+
+settings_store.set_lock_automation({
+    "enabled": True,
+    "targets": [
+        {"kind": "device", "id": "d0", "name": "Yeelight 显示器挂灯",
+         "unlock": "on", "lock": "off"},
+        {"kind": "automation", "id": "sc1", "name": "无人关灯",
+         "home_id": "home1", "unlock": "off", "lock": "on"},
+    ],
+})
+dlg6 = SettingsDialog(parent, DEMO_DEVICES, AUTOMATIONS)
+dlg6._switch_tab(_TAB_LOCK)
+app.processEvents()
+for row in dlg6._lock_rows:
+    assert row._combo.toolTip() == "", "目标下拉不该挂原生 tooltip"
+    for i in range(row._combo.count()):
+        assert row._combo.itemData(i, Qt.ItemDataRole.ToolTipRole) is None, \
+            "下拉项挂了原生 tooltip，鼠标扫过会弹黑色悬浮窗"
+    assert row._combo.view().textElideMode() == Qt.TextElideMode.ElideNone, \
+        "弹出列表应显示完整名称，不能靠 tooltip 补"
+    assert row._combo.view().minimumWidth() >= 260, \
+        "弹出列表太窄，长自动化名会被裁掉"
+
+first, second = dlg6._lock_rows
+assert first._combo.findText("自动化·无人关灯") == -1
+dlg6._remove_lock_row(second)
+app.processEvents()
+assert first._combo.findText("自动化·无人关灯") >= 0, \
+    "删掉占用行后目标没有回到下拉里"
+
+# 新增行也遵守过滤，且过滤重建不能弄丢选中项与三个动作值
+dlg6._add_lock_row()
+third = dlg6._lock_rows[-1]
+assert third._combo.findText("Yeelight 显示器挂灯（书房）") == -1
+_select_label(third, "自动化·无人关灯")
+assert first._combo.findText("自动化·无人关灯") == -1
+assert third.value()["id"] == "sc1" and third.value()["home_id"] == "home1"
+third._actions["unlock"].setCurrentIndex(1)  # 停用
+dlg6._remove_lock_row(first)
+app.processEvents()
+assert third.value()["id"] == "sc1", "过滤重建把选中目标弄丢了"
+assert third.value()["unlock"] == "off", "过滤重建把动作值弄丢了"
+dlg6.deleteLater()
+print("9. 无黑色 tooltip + 目标过滤随增删实时更新 OK")
 
 print("\n设置页分类测试全部通过")

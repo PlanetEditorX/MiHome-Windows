@@ -121,36 +121,42 @@ class LockTargetRow(QWidget):
     """
 
     removed = Signal(object)
+    # 目标变动后通知外层重算「其它行已占用」的过滤集合
+    target_changed = Signal(object)
 
     def __init__(self, options, target=None, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         target = target or {}
-        # _keys 与下拉索引一一对应；首项是占位（未选择）
-        self._keys: list[tuple[str, str, str, str]] = [("", "", "", "")]
-        labels = [_LOCK_TARGET_PLACEHOLDER]
+        # _all_keys 是全量候选，_keys 是当前下拉里真正可见的项；两者都与
+        # 下拉索引一一对应。首项是占位（未选择）。
+        self._all_keys: list[tuple[str, str, str, str]] = [("", "", "", "")]
+        all_labels = [_LOCK_TARGET_PLACEHOLDER]
         for kind, tid, name, home_id, label in options:
-            self._keys.append((kind, tid, name, home_id))
-            labels.append(label)
+            self._all_keys.append((kind, tid, name, home_id))
+            all_labels.append(label)
         current = 0
         if target.get("id"):
-            for index, (kind, tid, *_rest) in enumerate(self._keys):
+            for index, (kind, tid, *_rest) in enumerate(self._all_keys):
                 if tid and kind == target.get("kind") and tid == target.get("id"):
                     current = index
                     break
             else:
-                self._keys.append((
+                self._all_keys.append((
                     str(target.get("kind") or ""), str(target.get("id") or ""),
                     str(target.get("name") or ""),
                     str(target.get("home_id") or "")))
-                labels.append(f"{target.get('name') or target.get('id')}（未在列表）")
-                current = len(self._keys) - 1
+                all_labels.append(f"{target.get('name') or target.get('id')}（未在列表）")
+                current = len(self._all_keys) - 1
+        self._all_labels = all_labels
+        self._keys = list(self._all_keys)
+        self._labels = list(all_labels)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
 
-        self._combo = themed_combo(labels, current=labels[current])
+        self._combo = themed_combo(self._labels, current=self._labels[current])
         self._combo.setFixedHeight(_LOCK_ACTION_HEIGHT)
         # themed_combo 默认锁死 112px 固定宽度：设备名 + 房间名、尤其是
         # 米家自动化那种长名字会被裁成半截，还会把右侧三列挤散。
@@ -158,10 +164,17 @@ class LockTargetRow(QWidget):
         self._combo.setMinimumWidth(180)
         self._combo.setMaximumWidth(16777215)
         self._combo.currentIndexChanged.connect(self._on_target_changed)
-        # 米家自动化名常是一整句话，下拉里放不下；完整名走 tooltip
-        for index, text in enumerate(labels):
-            self._combo.setItemData(index, text, Qt.ItemDataRole.ToolTipRole)
-        self._combo.setToolTip(labels[current])
+        # 不给下拉项挂原生 tooltip：鼠标扫过选项时会弹一个黑底悬浮窗，
+        # 正好压住下面几行（用户反馈）。改为让弹出列表按最长文案撑开且
+        # 不省略文字，完整名称在列表里就能读全。
+        view = self._combo.view()
+        view.setTextElideMode(Qt.TextElideMode.ElideNone)
+        fm = self._combo.fontMetrics()
+        longest = max((fm.horizontalAdvance(t) for t in self._all_labels),
+                      default=0)
+        # 下限 420 兜住「离屏/缺中文字体时测量偏小」的情况，上限 760
+        # 防止一条超长自动化名把下拉撑出设置面板
+        view.setMinimumWidth(min(max(longest + 40, 420), 760))
         lay.addWidget(self._combo, stretch=1)
 
         self._actions: dict[str, object] = {}
@@ -233,8 +246,35 @@ class LockTargetRow(QWidget):
     # ---------- 交互 ----------
 
     def _on_target_changed(self) -> None:
-        self._combo.setToolTip(self._combo.currentText())
         self._fill_actions(None)
+        self._sync_action_enabled()
+        self.target_changed.emit(self)
+
+    def set_excluded(self, keys: set[tuple[str, str]]) -> None:
+        """把其它行已选的目标从本行下拉里过滤掉。
+
+        keys 是「除本行外」已被占用的 (kind, id) 集合。占位项与本行当前
+        选中项始终保留。重建期间必须屏蔽 currentIndexChanged，否则
+        clear()/addItems() 会连发信号、递归回到外层刷新。
+        """
+        index = self._combo.currentIndex()
+        current = (self._keys[index] if 0 <= index < len(self._keys)
+                   else self._all_keys[0])
+        wanted = [
+            (key, label)
+            for key, label in zip(self._all_keys, self._all_labels)
+            if key[:2] == ("", "") or key[:2] == current[:2]
+            or key[:2] not in keys
+        ]
+        if wanted == list(zip(self._keys, self._labels)):
+            return  # 过滤结果没变，别让下拉无谓地闪一下
+        self._combo.blockSignals(True)
+        self._combo.clear()
+        self._keys = [key for key, _ in wanted]
+        self._labels = [label for _, label in wanted]
+        self._combo.addItems(self._labels)
+        self._combo.setCurrentIndex(self._keys.index(current))
+        self._combo.blockSignals(False)
         self._sync_action_enabled()
 
     def _fill_actions(self, values: dict | None) -> None:
@@ -873,9 +913,11 @@ class SettingsDialog(OverlayDialog):
         row = LockTargetRow(self._lock_target_options, target,
                             self._lock_rows_host)
         row.removed.connect(self._remove_lock_row)
+        row.target_changed.connect(self._refresh_lock_target_filter)
         row.set_row_enabled(self._lock_toggle.isChecked())
         self._lock_rows_layout.addWidget(row)
         self._lock_rows.append(row)
+        self._refresh_lock_target_filter()
         self._refresh_lock_empty()
         # 新增的空行直接聚焦目标下拉：省一次点击
         if target is None:
@@ -887,7 +929,21 @@ class SettingsDialog(OverlayDialog):
         self._lock_rows_layout.removeWidget(row)
         row.setParent(None)
         row.deleteLater()
+        # 删掉一行就释放了它占的目标，其余行的下拉要把它放回来
+        self._refresh_lock_target_filter()
         self._refresh_lock_empty()
+
+    def _refresh_lock_target_filter(self, _row=None) -> None:
+        """同一目标只允许配一行：每行下拉剔除其它行已选的设备/自动化。
+
+        参数只为接住 target_changed 传来的行对象，刷新一律按当前全量
+        列表重算，避免增量维护漏掉「改选后释放旧目标」的情况。
+        """
+        chosen = [row.selected for row in self._lock_rows]
+        for index, row in enumerate(self._lock_rows):
+            used = {key for i, key in enumerate(chosen)
+                    if i != index and key != ("", "")}
+            row.set_excluded(used)
 
     def _refresh_lock_empty(self) -> None:
         """空态提示只在真的没有目标时出现。"""
