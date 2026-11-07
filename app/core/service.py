@@ -33,7 +33,14 @@ from mijiaAPI.devices import DevAction, DevProp
 from mijiaAPI.miutils import generate_enc_params, gen_nonce, get_signed_nonce
 
 from . import icon_store, spec_zh
-from .models import ActionInfo, DeviceDetail, DeviceInfo, PropInfo, SceneInfo
+from .models import (
+    ActionInfo,
+    AutomationInfo,
+    DeviceDetail,
+    DeviceInfo,
+    PropInfo,
+    SceneInfo,
+)
 from .net_guard import install_default_timeout
 
 # 上游多处 HTTP 调用没有 timeout（登录取二维码、刷新 token、设备列表），
@@ -50,6 +57,77 @@ _BATCH_SIZE = 20
 _SUB_DEVICE_SUFFIX = re.compile(r"\.s(\d+)$")
 # spec 并发拉取线程数；目标是 miot-spec.org 的独立请求，无会话竞争
 _SPEC_WORKERS = 8
+# 智能（场景 / 自动化）服务端点前缀
+_SCENE_SERVICE = "/appgateway/miot/appsceneservice/AppSceneService/"
+
+# 自动化动作名多为单字「开 / 关」，直接拼进卡片副标题读着像半句话
+_ACTION_VERBS = {"开": "打开", "关": "关闭", "开灯": "打开", "关灯": "关闭"}
+# 常见属性 (siid, piid) 的直白说法，其余按「设为 x」兜底
+_PROP_PHRASES = {
+    (2, 1): "",          # 开关：bool 值本身决定「打开 / 关闭」
+    (2, 2): "亮度",      # 亮度
+    (2, 3): "色温",      # 色温
+    (3, 6): "背灯",      # Yeelight 背灯
+}
+
+
+def _join_cn(left: str, right: str) -> str:
+    """中文之间不加空格，右侧以英文/数字起头时补一个，避免「关闭Yeelight」。"""
+    if not left or not right:
+        return left or right
+    return f"{left} {right}" if right[0].isascii() else f"{left}{right}"
+
+
+def _derived_action(payload: dict, device: str) -> str:
+    """列表接口的动作 name 常为空，只能从 payload 的 value 反推动作。
+
+    payload 形如 {"command": "set_properties",
+                  "value": [{"siid": 2, "piid": 1, "value": false}]}；
+    红外设备则是 {"command": "send_keys", ...}。
+    """
+    command = str(payload.get("command") or "")
+    if command == "send_keys":
+        return _join_cn("遥控", device)
+    values = payload.get("value")
+    if isinstance(values, list) and values and isinstance(values[0], dict):
+        first = values[0]
+        val = first.get("value")
+        noun = _PROP_PHRASES.get((first.get("siid"), first.get("piid")), "")
+        if isinstance(val, bool):
+            if noun:
+                return _join_cn(device, f"{noun}{'开' if val else '关'}")
+            return _join_cn("打开" if val else "关闭", device)
+        if noun:
+            return _join_cn(device, f"{noun}调到 {val}")
+        return _join_cn(device, f"设为 {val}")
+    return _join_cn(device, command) if command else device
+
+
+def _automation_action_text(raw: dict) -> str:
+    """把 scene_action 解析成「关闭 Yeelight 显示器挂灯」这类摘要。
+
+    只取第一个动作 + 总动作数：卡片副标题只有一行，全列出来也放不下；
+    payload_json 优先（列表接口已解析），退回 payload 字符串自行解码。
+    """
+    actions = ((raw.get("scene_action") or {}).get("actions")) or []
+    if not actions:
+        return ""
+    first = actions[0]
+    payload = first.get("payload_json")
+    if not isinstance(payload, dict):
+        try:
+            payload = json.loads(first.get("payload") or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+    device = str(payload.get("device_name") or "")
+    act = str(first.get("name") or "")
+    # 有名字时保持米家原文的语序（「氛围灯开」这类专有说法不硬翻）
+    text = _join_cn(device, act) if act else _derived_action(payload, device)
+    if not text:
+        text = "自动化动作"
+    if len(actions) > 1:
+        text += f" 等 {len(actions)} 个动作"
+    return text
 
 
 class ServiceError(Exception):
@@ -835,6 +913,71 @@ class MijiaService:
             raise _wrap_error(exc, f"执行场景「{scene.name}」失败") from exc
         if not ok:
             raise ServiceError(f"执行场景「{scene.name}」失败")
+
+    # ---------- 自动化（智能） ----------
+
+    def _scene_request(self, uri: str, home_id: str, **payload) -> Any:
+        """调 AppSceneService 的通用通道。
+
+        上游 mijiaAPI 只封装了手动场景的「列表 / 执行」，自动化的启停
+        没有对应方法，只能直接打这个服务。三个必需参数（app_version /
+        home_id / owner_uid）在所有场景接口上都一样，集中在这里补。
+        """
+        owner = self._api._get_home_owner(str(home_id))
+        data = {"app_version": 12, "home_id": str(home_id),
+                "owner_uid": owner, **payload}
+        return self._api._request(f"{_SCENE_SERVICE}{uri}", data)
+
+    def automation_list(self, home_name: str | None = None) -> list[AutomationInfo]:
+        """获取自动化列表；home_name 为 None 时返回全部家庭的自动化。
+
+        与 scene_list 走同一个 GetSimpleSceneList，只是取同级的
+        auto_scene_info_list —— 上游库把这一半丢掉了，所以这里不能用
+        api.get_scenes_list。
+        """
+        homes = self._home_ids_map()
+        if home_name is not None:
+            home_id = homes.get(home_name)
+            if home_id is None:
+                return []
+            targets = [(home_id, home_name)]
+        else:
+            id_to_name = {v: k for k, v in homes.items()}
+            targets = [(hid, id_to_name.get(hid, "")) for hid in homes.values()]
+
+        result: list[AutomationInfo] = []
+        for hid, hname in targets:
+            try:
+                ret = self._scene_request("GetSimpleSceneList", hid, get_type=2)
+            except Exception as exc:
+                raise _wrap_error(exc, "获取自动化列表失败") from exc
+            for raw in (ret or {}).get("auto_scene_info_list") or []:
+                result.append(AutomationInfo(
+                    scene_id=str(raw.get("scene_id") or ""),
+                    name=str(raw.get("name") or "未命名自动化"),
+                    home_id=str(raw.get("home_id") or hid),
+                    home_name=hname,
+                    enabled=bool(raw.get("enable")),
+                    action_text=_automation_action_text(raw),
+                ))
+        return result
+
+    def set_automation_enabled(
+            self, automation: AutomationInfo, enable: bool) -> None:
+        """拨自动化的云端总开关。
+
+        enable 必须是 JSON 布尔：传 1/0 会被服务端拒绝
+        （json: cannot unmarshal number into Go value of type bool）。
+        """
+        verb = "启用" if enable else "停用"
+        try:
+            ok = self._scene_request(
+                "SetSceneStatus", automation.home_id,
+                scene_id=automation.scene_id, enable=bool(enable))
+        except Exception as exc:
+            raise _wrap_error(exc, f"{verb}「{automation.name}」失败") from exc
+        if not ok:
+            raise ServiceError(f"{verb}「{automation.name}」失败")
 
     # ---------- 设备图标 ----------
 

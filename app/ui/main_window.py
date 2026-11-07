@@ -42,11 +42,12 @@ from app.core import cache as device_cache
 from app.core import icon_store, schedule_store
 from app.core.jobs import PRIORITY_CONTROL, PRIORITY_IDLE, JobExecutor
 from app.core.lock_automation import LockAutomation
-from app.core.models import DeviceInfo, SceneInfo, is_speaker
+from app.core.models import AutomationInfo, DeviceInfo, SceneInfo, is_speaker
 from app.core.scheduler import Scheduler
 from app.core.service import MijiaService
 from app.core.session_watch import SessionLockWatcher
 from app.ui.board_manager import BoardManagerDialog
+from app.ui.automation_card import AutomationCard
 from app.ui.device_card import DeviceCard
 from app.ui.device_dialog import DeviceDetailDialog
 from app.ui.scene_card import SceneCard
@@ -65,6 +66,9 @@ _ALL_ROOMS = "全屋"
 _ALL_HOMES = "全部"
 # 场景选项卡：位于「全屋」左侧的特殊房间值，选中后网格切换为场景视图
 _SCENE_TAB = "场景"
+# 自动化选项卡：排在所有房间之后，同样不是房间。刻意与「全屋」解耦：
+# 自动化不是设备，混进全屋网格会把设备列表搅乱，也让「共 N 台设备」失真
+_AUTO_TAB = "自动化"
 
 # 外部（APP/语音/物理按键）改状态后卡片靠轮询跟随。
 # 3 秒：一次整批读约 0.3~0.8 秒（批次已提到 20 台/次），加上间隔后
@@ -234,6 +238,10 @@ class MainWindow(QMainWindow):
         self._scene_cards: dict[str, SceneCard] = {}
         # 场景列表后台拉取防重入
         self._loading_scenes = False
+        # 自动化视图状态：与场景同一套语义（None 表示未加载，[] 为确认没有）
+        self._automations: list[AutomationInfo] | None = None
+        self._automation_cards: dict[str, AutomationCard] = {}
+        self._loading_automations = False
         # 产品页名称回退的异步查询防重入
         self._localize_busy = False
         # 已尝试过产品页查询的型号：失败后不再每 5 秒重试（实测该站点
@@ -1512,6 +1520,18 @@ class MainWindow(QMainWindow):
                          self._light_pill, self._consumable_pill):
                 pill.setVisible(False)
             return
+        if self._current_room == _AUTO_TAB:
+            # 自动化与设备无关：温湿度/开启数这些环境胶囊全部收起
+            items = self._automations or []
+            on = sum(1 for a in items if a.enabled)
+            self._count_label.setText(
+                f'<span style="color:{muted}">共 {len(items)} 个自动化</span>'
+                f'&nbsp;&nbsp;<span style="color:{online_dot}">●</span>'
+                f'&nbsp;<span style="color:{muted}">{on} 个已启用</span>')
+            for pill in (self._temp_pill, self._humidity_pill,
+                         self._light_pill, self._consumable_pill):
+                pill.setVisible(False)
+            return
         subset = self._visible_subset()
         total = len(subset)
         online = sum(1 for d in subset if d.online)
@@ -1677,8 +1697,13 @@ class MainWindow(QMainWindow):
         只按 `_visible_devices()` 轮询时，主界面切到别的房间后挂件里的设备
         就被排除在轮询之外——不是停止探测，而是"再也不刷新"：在米家 App
         里改了开关，挂件上一直显示切换房间那一刻的旧状态。
+
+        场景/自动化分页同理：它们不是房间，按全屋口径继续轮询，
+        否则停在那一页时所有设备状态都不再更新。
         """
-        dids = [d.did for d in self._visible_devices() if d.online]
+        special = self._current_room in (_SCENE_TAB, _AUTO_TAB)
+        dids = [d.did for d in self._visible_devices(
+            room=_ALL_ROOMS if special else None) if d.online]
         if self._board is None:
             return dids
         extra = set(self._board.tracked_dids()) - set(dids)
@@ -1847,16 +1872,20 @@ class MainWindow(QMainWindow):
         if self._all_devices:
             device_cache.save(self._all_devices, self._known_power, self._metrics)
 
-    def _visible_devices(self, *, include_hidden: bool = False) -> list[DeviceInfo]:
+    def _visible_devices(self, *, include_hidden: bool = False,
+                         room: str | None = None) -> list[DeviceInfo]:
         """当前家庭 + 房间范围内的设备，默认已应用展示开关过滤。
 
         include_hidden=True 时跳过「隐藏无功能 / 隐藏离线」两个展示开关：
         耗材统计等聚合口径用它，否则设备被折叠展示后耗材不足会静默漏报。
+        room 覆盖当前房间：场景/自动化这类非房间分页没有设备概念，
+        轮询需要它们按「全屋」口径继续跑，否则停在那一页时状态会冻结。
         """
+        room = self._current_room if room is None else room
         return [
             d for d in self._all_devices
             if (self._current_home == _ALL_HOMES or d.home_name == self._current_home)
-            and (self._current_room == _ALL_ROOMS or d.room_name == self._current_room)
+            and (room == _ALL_ROOMS or d.room_name == room)
             and (include_hidden or self._device_displayable(d))
         ]
 
@@ -1909,8 +1938,9 @@ class MainWindow(QMainWindow):
             return
         self._current_home = home
         self._current_room = _ALL_ROOMS
-        # 场景列表随家庭范围过滤，切家庭后旧缓存失效
+        # 场景/自动化列表都随家庭范围过滤，切家庭后旧缓存失效
         self._scenes = None
+        self._automations = None
         self._home_btn.setText(f"{home} ▾")
         self._rebuild_tabs()
         self._rebuild_grid()
@@ -1960,7 +1990,7 @@ class MainWindow(QMainWindow):
             d.room_name for d in self._all_devices
             if (self._current_home == _ALL_HOMES or d.home_name == self._current_home)
             and d.room_name and d.room_name != "未知"
-        })
+        }) + [_AUTO_TAB]
         for room in rooms:
             btn = themed_tab_button(room)
             btn.setCursor(Qt.PointingHandCursor)
@@ -1980,6 +2010,12 @@ class MainWindow(QMainWindow):
             if self._scenes is None:
                 self._show_status("正在加载场景…")
             self._load_scenes()
+            self._update_count_label()
+            return
+        if room == _AUTO_TAB:
+            if self._automations is None:
+                self._show_status("正在加载自动化…")
+            self._load_automations()
             self._update_count_label()
             return
         self._refresh_power_states(force=False)
@@ -2010,6 +2046,9 @@ class MainWindow(QMainWindow):
         for card in self._scene_cards.values():
             card.deleteLater()
         self._scene_cards.clear()
+        for card in self._automation_cards.values():
+            card.deleteLater()
+        self._automation_cards.clear()
         # takeAt 会移除条目，count 随之递减，循环必然终止
         while self._grid.count():
             if widget := self._grid.takeAt(0).widget():
@@ -2017,6 +2056,9 @@ class MainWindow(QMainWindow):
 
         if self._current_room == _SCENE_TAB:
             self._rebuild_scene_grid()
+            return
+        if self._current_room == _AUTO_TAB:
+            self._rebuild_automation_grid()
             return
 
         visible = sorted(
@@ -2078,6 +2120,30 @@ class MainWindow(QMainWindow):
             self._grid.addWidget(card, index // cols, index % cols)
         self._finalize_grid(cols, rows)
 
+    def _rebuild_automation_grid(self) -> None:
+        """自动化视图网格：卡片比设备卡宽，列数按自动化卡宽度换算。"""
+        automations = sorted(self._automations or [],
+                             key=lambda a: (not a.enabled, a.name))
+        if not automations:
+            hint = QLabel("暂无自动化，可在米家 APP「智能 → 自动化」中添加")
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hint.setFont(QFont("Microsoft YaHei UI", 12))
+            hint.setStyleSheet(
+                f"color: {SiColors.TEXT_MUTED}; background: transparent;")
+            self._grid.addWidget(hint, 0, 0)
+            return
+
+        from app.ui.automation_card import CARD_WIDTH as _AUTO_W
+        cols = self._columns_for_width(self._scroll.viewport().width(), _AUTO_W)
+        self._grid_columns = cols
+        rows = (len(automations) + cols - 1) // cols
+        for index, automation in enumerate(automations):
+            card = AutomationCard(automation)
+            card.toggled.connect(self._on_automation_toggled)
+            self._automation_cards[automation.scene_id] = card
+            self._grid.addWidget(card, index // cols, index % cols)
+        self._finalize_grid(cols, rows)
+
     def _finalize_grid(self, cols: int, rows: int) -> None:
         # 列宽不参与剩余空间分配、布局整体左对齐：卡片宽度固定，窗口
         # 加宽只应增加列数（_columns_for_width 已按此语义计算），若把
@@ -2091,15 +2157,16 @@ class MainWindow(QMainWindow):
             self._grid.setRowStretch(row, 0)
         self._grid.setRowStretch(rows, 1)
 
-    def _columns_for_width(self, width: int) -> int:
+    def _columns_for_width(self, width: int, card_width: int | None = None) -> int:
         # 固定卡片宽度，列数随可视宽度动态计算，避免缩窄时卡片被裁切
         from app.ui.device_card import _CARD_FIXED_WIDTH
+        card_width = card_width or _CARD_FIXED_WIDTH
         spacing = 14
         right_margin = 12
         eff = max(0, width - right_margin)
         if eff <= 0:
             return 1
-        cols = (eff + spacing) // (_CARD_FIXED_WIDTH + spacing)
+        cols = (eff + spacing) // (card_width + spacing)
         # 不设单排上限——宽屏下应自然补列而不是拉开卡片间距
         return max(1, cols)
 
@@ -2337,6 +2404,74 @@ class MainWindow(QMainWindow):
             return
         card.set_busy(False)
         Toast.info(self, f"执行场景「{scene.name}」失败：{error}", 4000)
+
+    # ---------- 自动化（智能） ----------
+
+    def _load_automations(self) -> None:
+        """拉取当前范围的自动化列表；失败保留已有缓存。"""
+        if self._loading_automations:
+            return
+        self._loading_automations = True
+        self._jobs.submit(
+            lambda: self._service.automation_list(
+                None if self._current_home == _ALL_HOMES else self._current_home),
+            on_success=self._on_automations_loaded,
+            on_error=self._on_automations_failed,
+        )
+
+    def _on_automations_loaded(self, automations: list[AutomationInfo]) -> None:
+        self._loading_automations = False
+        self._automations = automations
+        if self._current_room == _AUTO_TAB:
+            self._rebuild_grid()
+            self._update_count_label()
+
+    def _on_automations_failed(self, error: Exception) -> None:
+        self._loading_automations = False
+        logger.warning("加载自动化失败: %s", error)
+        if self._current_room != _AUTO_TAB:
+            # 预取失败且用户不在自动化视图：进页面时会重新拉取
+            return
+        if self._automations is None:
+            self._show_status("自动化加载失败", 4000)
+        else:
+            Toast.info(self, f"自动化刷新失败：{error}", 4000)
+
+    def _on_automation_toggled(self, scene_id: str, enable: bool) -> None:
+        automation = next(
+            (a for a in (self._automations or []) if a.scene_id == scene_id), None)
+        card = self._automation_cards.get(scene_id)
+        if automation is None or card is None:
+            return
+        card.set_busy(True)
+        self._jobs.submit(
+            lambda a=automation, on=enable: self._service.set_automation_enabled(a, on),
+            on_success=lambda _, a=automation, on=enable, c=card:
+                self._on_automation_done(a, on, c),
+            on_error=lambda e, a=automation, c=card:
+                self._on_automation_failed(a, c, e),
+        )
+
+    def _on_automation_done(
+            self, automation: AutomationInfo, enable: bool, card: AutomationCard) -> None:
+        # 卡片可能在任务排队期间随网格重建被销毁；模型状态仍要落定，
+        # 否则下次建卡会把旧状态重新画出来
+        automation.enabled = enable
+        if shiboken6.isValid(card):
+            card.set_busy(False)
+            card.set_enabled_state(enable)
+        self._update_count_label()
+        Toast.info(
+            self, f"已{'启用' if enable else '停用'}「{automation.name}」", 3000)
+
+    def _on_automation_failed(
+            self, automation: AutomationInfo, card: AutomationCard,
+            error: Exception) -> None:
+        if shiboken6.isValid(card):
+            card.set_busy(False)
+            # 开关已被用户拨过去，失败必须拨回来，否则界面在说谎
+            card.set_enabled_state(automation.enabled)
+        Toast.info(self, f"操作失败：{error}", 4000)
 
     # ---------- 详情 ----------
 

@@ -75,6 +75,26 @@ class SceneInfo:
     home_name: str = ""
 
 
+@dataclass
+class AutomationInfo:
+    """米家自动化（米家 APP → 智能 → 自动化 中创建的项）。
+
+    与手动场景同源不同表：都来自 GetSimpleSceneList，区别是自动化在
+    auto_scene_info_list 里、还带一个云端总开关。enabled 就是这个开关
+    的状态，改它等价于在 APP 里拨那条自动化的启用/停用。
+
+    action_text 是解析出的动作摘要，只用于卡片副标题；云端没给（或
+    结构无法识别）时留空，界面据此退化成「自动化」。
+    """
+
+    scene_id: str
+    name: str
+    home_id: str
+    home_name: str = ""
+    enabled: bool = False
+    action_text: str = ""
+
+
 def is_speaker(device: DeviceInfo) -> bool:
     """小爱音箱判定：音频控制栏、语音入口共用同一标准。
 
